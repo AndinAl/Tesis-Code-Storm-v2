@@ -1,0 +1,104 @@
+Best Validation Checkpoint Summary
+==================================
+Date: 2026-04-01
+Generated: 2026-04-01T10:08:04
+
+Checkpoint
+----------
+Best episode: 5
+Best validation reward: 47.715209273102815
+Best model path: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Model/outputs/best_q_net.pt
+Final model path: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Model/outputs/q_net.pt
+
+Core Parameters (Config)
+------------------------
+network_json: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Data/data/network.json
+imputed_flow_npz: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Model/outputs_imputation/imputed_edge_flow_matrix.npz
+horizon: 24
+history_len: 4
+train_ratio: 0.7
+val_ratio: 0.15
+validation_start: 2024-04-30 02:30:00
+validation_end: 2024-06-22 19:14:00
+capacity_quantile: 0.95
+threshold_alpha: 0.66
+reward_alpha: 0.01
+reward_beta: 5.0
+reward_kappa: 0.15
+reward_eta: 5.0
+reward_saturation_threshold: 0.72
+reward_saturation_weight: 5.0
+gamma: 0.99
+max_budget: 10
+hidden_dim: 64
+gnn_layers: 3
+episodes: 180
+lr: 0.0001
+lr_min: 1e-05
+batch_size: 64
+replay_capacity: 5000
+warmup_steps: 64
+target_update_tau: 0.005
+max_grad_norm: 1.0
+epsilon_start: 1.0
+epsilon_end: 0.05
+epsilon_decay_steps: 5000
+incident_prob_train: 0.35
+incident_prob_eval: 1.0
+incident_factor_low: 0.2
+incident_factor_high: 0.6
+incident_duration_min: 2
+incident_duration_max: 6
+incident_edge_fraction: 0.1
+eval_split: val
+eval_episodes: 4
+expected_directed_edges: 852
+report_reward_normalization_edges: 852
+
+Data Split
+----------
+num_steps: 38736
+horizon: 24
+train_days: 1064
+val_days: 54
+test_days: 496
+validation_start_config: 2024-04-30 02:30:00
+validation_end_config: 2024-06-22 19:14:00
+train_window:
+  start_index: 0
+  end_index: 25535
+  start_time: 2021-06-01T00:00:00.000000000
+  end_time: 2024-04-29T23:00:00.000000000
+val_window:
+  start_index: 25536
+  end_index: 26831
+  start_time: 2024-04-30T00:00:00.000000000
+  end_time: 2024-06-22T23:00:00.000000000
+test_window:
+  start_index: 26832
+  end_index: 38735
+  start_time: 2024-06-23T00:00:00.000000000
+  end_time: 2025-10-31T23:00:00.000000000
+
+Evaluation Snapshot (eval_full_20260401_000111.log)
+----------------------------------------------------
+Shared-Schedule Policy Comparison:
+  random | J= -0.636 | J_int=116.750 | MTTD= 1.010 | S= 0.012 | phi= 0.271 | D= 4.458 | B= 4.656
+  greedy | J= 46.127 | J_int=305.250 | MTTD= 4.345 | S= 0.032 | phi= 0.177 | D= 2.906 | B=10.000
+  degree | J= 50.029 | J_int=255.250 | MTTD=12.500 | S= 0.027 | phi= 0.013 | D= 0.219 | B=10.000
+  rl | J= 47.715 | J_int=240.250 | MTTD=11.809 | S= 0.025 | phi= 0.004 | D= 0.062 | B=10.000
+Storm Stress Test:
+  storm | J= 47.992 | J_int=240.000 | MTTD=12.500 | S= 0.025 | phi= 0.000 | D= 0.000 | B=10.000
+
+Paper Artifacts Included
+------------------------
+pareto_frontier_v2.pdf
+cumulative_reward_comparison_v2.pdf
+backbone_utilization_vs_capacity_v2.pdf
+node_betweenness_top10_v2.pdf
+geodash_rl_incident_trace_v2.pdf
+geodash_rl_vs_greedy_peak_v2.pdf
+analysis_tables.tex.txt
+latest_policy_metrics.csv
+stress_test_metrics.csv
+report_summary.txt

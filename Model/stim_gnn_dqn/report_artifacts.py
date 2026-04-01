@@ -16,6 +16,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
+from matplotlib.transforms import Bbox
 
 from .baselines import greedy_coverage_policy, random_policy, static_degree_policy
 from .config import Config
@@ -71,13 +72,13 @@ def set_publication_style() -> None:
         {
             "font.family": "sans-serif",
             "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
-            "font.size": 9,
-            "axes.titlesize": 10,
+            "font.size": 8,
+            "axes.titlesize": 9,
             "axes.titleweight": "normal",
-            "axes.labelsize": 9,
-            "legend.fontsize": 8,
-            "xtick.labelsize": 8,
-            "ytick.labelsize": 8,
+            "axes.labelsize": 8,
+            "legend.fontsize": 7,
+            "xtick.labelsize": 7,
+            "ytick.labelsize": 7,
             "axes.spines.top": False,
             "axes.spines.right": False,
             "figure.facecolor": "white",
@@ -158,7 +159,8 @@ def load_model(cfg: Config, env: CapacityConstrainedEnv, device: str) -> GNNQNet
         hidden_dim=cfg.hidden_dim,
         gnn_layers=cfg.gnn_layers,
     ).to(device)
-    model_path = cfg.workdir_path / "q_net.pt"
+    best_model_path = cfg.workdir_path / "best_q_net.pt"
+    model_path = best_model_path if best_model_path.exists() else (cfg.workdir_path / "q_net.pt")
     if model_path.exists():
         try:
             q_net.load_state_dict(torch.load(model_path, map_location=device))
@@ -523,14 +525,6 @@ def plot_pareto_frontier(
             label=name.upper(),
             zorder=3,
         )
-        ax.annotate(
-            name.upper(),
-            xy=(vals["J_int"], vals["MTTD"]),
-            xytext=(6, 6),
-            textcoords="offset points",
-            fontsize=8,
-            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#cfcfcf", "alpha": 0.95},
-        )
 
     frontier = []
     best_y = -1e9
@@ -569,7 +563,7 @@ def plot_cumulative_reward(
     reward_beta: float,
     reward_norm_edges: int | None = None,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 3.8), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 3.8), constrained_layout=False)
     palette = {
         "random": "#8c8c8c",
         "degree": "#2c7fb8",
@@ -583,15 +577,6 @@ def plot_cumulative_reward(
         color = palette.get(name, "#333333")
         ax.plot(x, y, linewidth=2.4, color=color, label=name.upper())
         ax.scatter([x[-1]], [y[-1]], s=28, color=color, zorder=3)
-        ax.annotate(
-            name.upper(),
-            xy=(x[-1], y[-1]),
-            xytext=(6, 0),
-            textcoords="offset points",
-            va="center",
-            fontsize=8,
-            color=color,
-        )
 
         if name == "rl":
             norm = float(int(reward_norm_edges)) if reward_norm_edges is not None and int(reward_norm_edges) > 0 else 1.0
@@ -619,7 +604,8 @@ def plot_cumulative_reward(
     ax.set_xlabel("Snapshot within Episode")
     ax.set_ylabel(r"Cumulative Reward $J$")
     ax.grid(alpha=0.25, linestyle="--")
-    ax.legend(frameon=False, ncol=3, loc="upper left")
+    fig.subplots_adjust(bottom=0.22)
+    ax.legend(frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.16))
     save_pdf(fig, out_path)
     plt.close(fig)
 
@@ -631,7 +617,7 @@ def plot_backbone_timeseries(
     moment_t: int,
     node_name: str,
     threshold: float,
-    out_path: Path,
+    out_paths: Dict[str, Path],
 ) -> None:
     rl_util_c = np.array([step.utilization_c[node_idx] for step in rl_trace.steps])
     gr_util_c = np.array([step.utilization_c[node_idx] for step in greedy_trace.steps])
@@ -641,21 +627,16 @@ def plot_backbone_timeseries(
     gr_active = np.array([step.active_mask[node_idx] for step in greedy_trace.steps])
     x = np.arange(len(rl_trace.steps), dtype=np.float32)
 
-    fig, (ax_c, ax_d, ax_bottom) = plt.subplots(
-        3,
-        1,
-        figsize=(FULL_WIDTH_IN, 5.6),
-        sharex=True,
-        constrained_layout=True,
-        gridspec_kw={"height_ratios": [2.0, 2.0, 1.2]},
-    )
-
+    # Direction C utilization
+    fig_c, ax_c = plt.subplots(figsize=(FULL_WIDTH_IN, 3.1), constrained_layout=True)
     ax_c.plot(x, gr_util_c, color="#d95f02", linewidth=2.1, label="Greedy (Dir C)")
     ax_c.plot(x, rl_util_c, color="#1b9e77", linewidth=2.1, label="RL (Dir C)")
     ax_c.axhline(threshold, color="#a50f15", linestyle="--", linewidth=1.3, label="Saturation Threshold")
     ax_c.axvline(moment_t, color="#444444", linestyle=":", linewidth=1.3)
     ax_c.fill_between(x, threshold, np.maximum(gr_util_c, threshold), where=gr_util_c > threshold, color="#d95f02", alpha=0.10)
     ax_c.set_ylabel("Utilization C")
+    ax_c.set_xlabel("Snapshot within Episode")
+    ax_c.set_title(f"Backbone Utilization (Direction C) - Node {node_name}")
     ax_c.text(
         0.01,
         0.97,
@@ -667,25 +648,39 @@ def plot_backbone_timeseries(
         bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d0d0d0", "alpha": 0.95},
     )
     ax_c.grid(alpha=0.25, linestyle="--")
-    ax_c.legend(frameon=False, ncol=3, loc="upper left")
+    ax_c.legend(frameon=False, ncol=2, loc="upper right")
+    save_pdf(fig_c, out_paths["c"])
+    plt.close(fig_c)
 
+    # Direction D utilization
+    fig_d, ax_d = plt.subplots(figsize=(FULL_WIDTH_IN, 3.1), constrained_layout=True)
     ax_d.plot(x, gr_util_d, color="#e6550d", linewidth=2.1, linestyle="--", label="Greedy (Dir D)")
     ax_d.plot(x, rl_util_d, color="#31a354", linewidth=2.1, linestyle="--", label="RL (Dir D)")
     ax_d.axhline(threshold, color="#a50f15", linestyle="--", linewidth=1.3)
     ax_d.axvline(moment_t, color="#444444", linestyle=":", linewidth=1.3)
     ax_d.fill_between(x, threshold, np.maximum(gr_util_d, threshold), where=gr_util_d > threshold, color="#e6550d", alpha=0.08)
-    ax_d.annotate(
+    ax_d.text(
+        0.98,
+        0.34,
         "Asymmetry handled by RL:\nDir C and Dir D can diverge",
-        xy=(moment_t, rl_util_d[moment_t]),
-        xytext=(max(0, moment_t - 5), max(threshold + 0.03, float(rl_util_d.max()) + 0.05)),
-        arrowprops={"arrowstyle": "->", "color": "#1b9e77"},
-        fontsize=8,
+        transform=ax_d.transAxes,
+        ha="right",
+        va="center",
+        fontsize=7,
         color="#1b9e77",
+        bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "#a6dba0", "alpha": 0.92},
+        zorder=6,
     )
     ax_d.set_ylabel("Utilization D")
+    ax_d.set_xlabel("Snapshot within Episode")
+    ax_d.set_title(f"Backbone Utilization (Direction D) - Node {node_name}")
     ax_d.grid(alpha=0.25, linestyle="--")
-    ax_d.legend(frameon=False, ncol=2, loc="upper left")
+    ax_d.legend(frameon=False, ncol=1, loc="center right", bbox_to_anchor=(0.98, 0.64))
+    save_pdf(fig_d, out_paths["d"])
+    plt.close(fig_d)
 
+    # Activation timeline
+    fig_a, ax_bottom = plt.subplots(figsize=(FULL_WIDTH_IN, 2.6), constrained_layout=True)
     ax_bottom.step(x, gr_active, where="post", color="#d95f02", linewidth=2.0, label="Greedy Active")
     ax_bottom.step(x, rl_active, where="post", color="#1b9e77", linewidth=2.0, label="RL Active")
     ax_bottom.fill_between(x, 0, rl_active, step="post", alpha=0.18, color="#1b9e77")
@@ -696,10 +691,11 @@ def plot_backbone_timeseries(
     ax_bottom.set_yticklabels(["Off", "On"])
     ax_bottom.set_xlabel("Snapshot within Episode")
     ax_bottom.set_ylabel("Activation")
+    ax_bottom.set_title(f"Backbone Activation Timeline - Node {node_name}")
     ax_bottom.grid(alpha=0.25, linestyle="--")
-    ax_bottom.legend(frameon=False, ncol=2, loc="upper left")
-    save_pdf(fig, out_path)
-    plt.close(fig)
+    ax_bottom.legend(frameon=False, ncol=2, loc="upper right")
+    save_pdf(fig_a, out_paths["activation"])
+    plt.close(fig_a)
 
 
 def top_betweenness_indices(static: StaticParameters, top_k: int = 10) -> np.ndarray:
@@ -756,6 +752,7 @@ def plot_base_map(
     static: StaticParameters,
     highlight_top10: bool = False,
     backbone_idx: int | None = None,
+    show_axis_labels: bool = True,
 ) -> None:
     coords = dataset.coords.detach().cpu().numpy()
     lat = coords[:, 0]
@@ -813,8 +810,9 @@ def plot_base_map(
             zorder=6,
         )
 
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    if show_axis_labels:
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(alpha=0.15, linestyle=":")
 
@@ -828,8 +826,17 @@ def overlay_policy_map(
     backbone_idx: int,
     title: str,
     highlight_incidents: bool = False,
+    show_axis_labels: bool = True,
+    show_incident_count_label: bool = True,
 ) -> LineCollection:
-    plot_base_map(ax, dataset, static, highlight_top10=False, backbone_idx=backbone_idx)
+    plot_base_map(
+        ax,
+        dataset,
+        static,
+        highlight_top10=False,
+        backbone_idx=backbone_idx,
+        show_axis_labels=show_axis_labels,
+    )
     coords = dataset.coords.detach().cpu().numpy()
     lat = coords[:, 0]
     lon = coords[:, 1]
@@ -860,16 +867,17 @@ def overlay_policy_map(
         ax.add_collection(incident_lines)
         for seg in incident_segments[:20]:
             _add_segment_arrow(ax, seg, color="#2b8cbe", alpha=0.9, zorder=5)
-        ax.text(
-            0.02,
-            0.08,
-            f"Incident-reduced directed segments: {int(step.incident_edge_mask.sum())}",
-            transform=ax.transAxes,
-            va="bottom",
-            ha="left",
-            fontsize=7,
-            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#b5d4e9", "alpha": 0.96},
-        )
+        if show_incident_count_label:
+            ax.text(
+                0.02,
+                0.08,
+                f"Incident-reduced directed segments: {int(step.incident_edge_mask.sum())}",
+                transform=ax.transAxes,
+                va="bottom",
+                ha="left",
+                fontsize=7,
+                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#b5d4e9", "alpha": 0.96},
+            )
 
     prev_active = prev_step.active_mask > 0.5
     curr_active = step.active_mask > 0.5
@@ -951,6 +959,273 @@ def _map_legend_handles() -> List[Line2D]:
     ]
 
 
+def _smart_annotate_points(
+    ax,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    labels: List[str],
+    fontsize: int = 7,
+) -> None:
+    if len(labels) == 0:
+        return
+
+    candidate_offsets = [
+        (8, 8, "left", "bottom"),
+        (8, -8, "left", "top"),
+        (-8, 8, "right", "bottom"),
+        (-8, -8, "right", "top"),
+        (14, 0, "left", "center"),
+        (-14, 0, "right", "center"),
+        (0, 14, "center", "bottom"),
+        (0, -14, "center", "top"),
+        (18, 10, "left", "bottom"),
+        (-18, 10, "right", "bottom"),
+        (18, -10, "left", "top"),
+        (-18, -10, "right", "top"),
+        (24, 0, "left", "center"),
+        (-24, 0, "right", "center"),
+    ]
+
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fig_bbox = fig.bbox
+    placed_boxes: List[Bbox] = []
+
+    for x, y, label in zip(xs, ys, labels):
+        chosen = None
+        chosen_bbox = None
+
+        for dx, dy, ha, va in candidate_offsets:
+            ann = ax.annotate(
+                label,
+                xy=(float(x), float(y)),
+                xytext=(dx, dy),
+                textcoords="offset points",
+                fontsize=fontsize,
+                ha=ha,
+                va=va,
+                arrowprops={"arrowstyle": "-", "color": "#6b6b6b", "lw": 0.6, "alpha": 0.85},
+                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d0d0d0", "alpha": 0.94},
+                zorder=7,
+            )
+            bbox = ann.get_window_extent(renderer=renderer).expanded(1.04, 1.08)
+            inside = (
+                bbox.x0 >= fig_bbox.x0
+                and bbox.y0 >= fig_bbox.y0
+                and bbox.x1 <= fig_bbox.x1
+                and bbox.y1 <= fig_bbox.y1
+            )
+            overlaps = any(bbox.overlaps(prev) for prev in placed_boxes)
+            if inside and not overlaps:
+                chosen = ann
+                chosen_bbox = bbox
+                break
+            ann.remove()
+
+        if chosen is None:
+            chosen = ax.annotate(
+                label,
+                xy=(float(x), float(y)),
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontsize=fontsize,
+                ha="left",
+                va="bottom",
+                arrowprops={"arrowstyle": "-", "color": "#6b6b6b", "lw": 0.6, "alpha": 0.85},
+                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d0d0d0", "alpha": 0.94},
+                zorder=7,
+            )
+            chosen_bbox = chosen.get_window_extent(renderer=renderer).expanded(1.04, 1.08)
+
+        placed_boxes.append(chosen_bbox)
+
+
+def plot_directed_network_arrows_map(
+    dataset: STIMDataset,
+    out_path: Path,
+) -> None:
+    coords = dataset.coords.detach().cpu().numpy()
+    lat = coords[:, 0]
+    lon = coords[:, 1]
+    segments = _directed_edge_segments(dataset, offset_ratio=0.09)
+    c_mask_t, d_mask_t = _direction_masks(dataset)
+    c_mask = c_mask_t.detach().cpu().numpy()
+    d_mask = d_mask_t.detach().cpu().numpy()
+    unknown_mask = ~(c_mask | d_mask)
+
+    fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 4.4), constrained_layout=True)
+    ax.scatter(lon, lat, s=12, color="#6f6f6f", alpha=0.75, zorder=1)
+
+    direction_specs = [
+        ("Direction C", c_mask, "#1f78b4"),
+        ("Direction D", d_mask, "#e6550d"),
+        ("Unknown", unknown_mask, "#9e9e9e"),
+    ]
+    for label, mask, color in direction_specs:
+        if not np.any(mask):
+            continue
+        line = LineCollection(
+            segments[mask],
+            colors=color,
+            linewidths=1.25,
+            alpha=0.78,
+            zorder=2,
+        )
+        ax.add_collection(line)
+        for seg in segments[mask]:
+            _add_segment_arrow(ax, seg, color=color, alpha=0.68, zorder=3)
+
+    handles = [
+        Line2D([0], [0], color="#1f78b4", linewidth=2.0, label="Direction C"),
+        Line2D([0], [0], color="#e6550d", linewidth=2.0, label="Direction D"),
+        Line2D([0], [0], color="#9e9e9e", linewidth=2.0, label="Unknown direction"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#6f6f6f", markersize=6, label="Nodes"),
+    ]
+    ax.legend(handles=handles, frameon=False, loc="upper left", ncol=2)
+    ax.set_title("Directed Road Network (Colored Arrows by Edge Direction)")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(alpha=0.15, linestyle=":")
+    save_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def plot_directed_network_single_direction_map(
+    dataset: STIMDataset,
+    direction: str,
+    out_path: Path,
+) -> None:
+    direction_upper = direction.upper()
+    if direction_upper not in {"C", "D"}:
+        raise ValueError(f"direction must be 'C' or 'D', got {direction}")
+
+    coords = dataset.coords.detach().cpu().numpy()
+    lat = coords[:, 0]
+    lon = coords[:, 1]
+    segments = _directed_edge_segments(dataset, offset_ratio=0.09)
+    c_mask_t, d_mask_t = _direction_masks(dataset)
+    c_mask = c_mask_t.detach().cpu().numpy()
+    d_mask = d_mask_t.detach().cpu().numpy()
+    mask = c_mask if direction_upper == "C" else d_mask
+    color = "#1f78b4" if direction_upper == "C" else "#e6550d"
+    label = f"Direction {direction_upper}"
+
+    fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 4.4), constrained_layout=True)
+    ax.scatter(lon, lat, s=11, color="#6f6f6f", alpha=0.68, zorder=1)
+
+    # Keep the opposite direction as context, but faint.
+    context = LineCollection(
+        segments[~mask],
+        colors="#c6c6c6",
+        linewidths=0.45,
+        alpha=0.25,
+        zorder=1,
+    )
+    ax.add_collection(context)
+
+    main_lines = LineCollection(
+        segments[mask],
+        colors=color,
+        linewidths=1.35,
+        alpha=0.86,
+        zorder=2,
+    )
+    ax.add_collection(main_lines)
+    for seg in segments[mask]:
+        _add_segment_arrow(ax, seg, color=color, alpha=0.72, zorder=3)
+
+    handles = [
+        Line2D([0], [0], color=color, linewidth=2.0, label=label),
+        Line2D([0], [0], color="#c6c6c6", linewidth=2.0, label="Other direction (context)"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#6f6f6f", markersize=6, label="Nodes"),
+    ]
+    ax.legend(handles=handles, frameon=False, loc="upper left")
+    ax.set_title(f"Directed Road Network - {label}")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(alpha=0.15, linestyle=":")
+    save_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def _incident_node_counts(dataset: STIMDataset, mapped_incidents) -> np.ndarray:
+    counts = np.zeros(dataset.num_nodes, dtype=np.float32)
+    if mapped_incidents is None or mapped_incidents.empty:
+        return counts
+
+    src = dataset.edge_index[0].detach().cpu().numpy()
+    dst = dataset.edge_index[1].detach().cpu().numpy()
+    segment_ids = mapped_incidents["segment_id"].to_numpy(dtype=np.int64, copy=False)
+    valid = segment_ids[(segment_ids >= 0) & (segment_ids < dataset.num_edges)]
+    if valid.size == 0:
+        return counts
+
+    np.add.at(counts, src[valid], 1.0)
+    np.add.at(counts, dst[valid], 1.0)
+    return counts
+
+
+def plot_incident_nodes_map(
+    dataset: STIMDataset,
+    static: StaticParameters,
+    mapped_incidents,
+    out_path: Path,
+) -> None:
+    coords = dataset.coords.detach().cpu().numpy()
+    lat = coords[:, 0]
+    lon = coords[:, 1]
+    counts = _incident_node_counts(dataset, mapped_incidents)
+    active = counts > 0
+
+    fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 4.6), constrained_layout=True)
+    plot_base_map(ax, dataset, static, highlight_top10=False, backbone_idx=None)
+
+    if np.any(active):
+        active_counts = counts[active]
+        size = 36.0 + 240.0 * (active_counts / max(1.0, float(active_counts.max())))
+        scatter = ax.scatter(
+            lon[active],
+            lat[active],
+            s=size,
+            c=active_counts,
+            cmap="Reds",
+            edgecolors="#333333",
+            linewidths=0.6,
+            alpha=0.92,
+            zorder=5,
+        )
+        cbar = fig.colorbar(scatter, ax=ax, fraction=0.032, pad=0.02)
+        cbar.set_label("Incident-node hit count")
+
+        top_idx = np.argsort(-counts)[: min(10, int(np.sum(active)))]
+        label_idx = [int(i) for i in top_idx if counts[i] > 0]
+        label_texts = [f"{dataset.node_names[i]} ({int(counts[i])})" for i in label_idx]
+        label_x = np.array([lon[i] for i in label_idx], dtype=np.float32)
+        label_y = np.array([lat[i] for i in label_idx], dtype=np.float32)
+        _smart_annotate_points(ax, label_x, label_y, label_texts, fontsize=7)
+    else:
+        ax.text(
+            0.02,
+            0.98,
+            "No mapped incident nodes found",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=8,
+            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d0d0d0", "alpha": 0.95},
+        )
+
+    ax.set_title("Incident Nodes on Directed Network Map")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.grid(alpha=0.15, linestyle=":")
+    save_pdf(fig, out_path)
+    plt.close(fig)
+
+
 def create_incident_trace_pdf(
     dataset: STIMDataset,
     static: StaticParameters,
@@ -960,7 +1235,7 @@ def create_incident_trace_pdf(
     out_path: Path,
 ) -> None:
     map_legend = _map_legend_handles()
-    fig, axes = plt.subplots(1, 3, figsize=(FULL_WIDTH_IN, 2.9), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(FULL_WIDTH_IN, 2.95), constrained_layout=False)
     times = [max(0, peak_t - 1), peak_t, min(len(rl_trace.steps) - 1, peak_t + 1)]
     contour: LineCollection | None = None
     for ax, t in zip(axes, times):
@@ -973,10 +1248,15 @@ def create_incident_trace_pdf(
             backbone_idx,
             title=f"RL (SMA), t={t}",
             highlight_incidents=True,
+            show_axis_labels=False,
+            show_incident_count_label=False,
         )
     if contour is not None:
-        fig.colorbar(contour, ax=axes, fraction=0.03, pad=0.02, label="Directed Edge Utilization")
-    fig.legend(handles=map_legend, frameon=False, ncol=3, loc="lower center")
+        fig.colorbar(contour, ax=axes, fraction=0.03, pad=0.01, label="Directed Edge Utilization")
+    fig.subplots_adjust(bottom=0.30, wspace=0.09)
+    fig.legend(handles=map_legend, frameon=False, ncol=2, loc="lower center", bbox_to_anchor=(0.5, 0.01))
+    fig.supxlabel("Longitude")
+    fig.supylabel("Latitude")
     save_pdf(fig, out_path)
     plt.close(fig)
 
@@ -991,7 +1271,7 @@ def create_advantage_pdf(
     out_path: Path,
 ) -> None:
     map_legend = _map_legend_handles()
-    fig, axes = plt.subplots(1, 2, figsize=(FULL_WIDTH_IN, 3.2), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(FULL_WIDTH_IN, 3.25), constrained_layout=False)
     contour_left = overlay_policy_map(
         axes[0],
         dataset,
@@ -1001,6 +1281,8 @@ def create_advantage_pdf(
         backbone_idx,
         title=f"RL (SMA), t={peak_t}",
         highlight_incidents=True,
+        show_axis_labels=True,
+        show_incident_count_label=True,
     )
     contour_right = overlay_policy_map(
         axes[1],
@@ -1011,10 +1293,13 @@ def create_advantage_pdf(
         backbone_idx,
         title=f"Greedy, t={peak_t}",
         highlight_incidents=True,
+        show_axis_labels=True,
+        show_incident_count_label=True,
     )
     contour = contour_right if contour_right is not None else contour_left
-    fig.colorbar(contour, ax=axes, fraction=0.03, pad=0.02, label="Directed Edge Utilization")
-    fig.legend(handles=map_legend, frameon=False, ncol=3, loc="lower center")
+    fig.colorbar(contour, ax=axes, fraction=0.03, pad=0.01, label="Directed Edge Utilization")
+    fig.subplots_adjust(bottom=0.30, wspace=0.08)
+    fig.legend(handles=map_legend, frameon=False, ncol=2, loc="lower center", bbox_to_anchor=(0.5, 0.01))
     save_pdf(fig, out_path)
     plt.close(fig)
 
@@ -1224,7 +1509,9 @@ def main() -> None:
         threshold=cfg.reward_saturation_threshold,
     )
     backbone_name = dataset.node_names[backbone_idx]
-    timeseries_path = fresh_output_path(outdir / "backbone_utilization_vs_capacity.pdf")
+    timeseries_c_path = fresh_output_path(outdir / "backbone_utilization_direction_c.pdf")
+    timeseries_d_path = fresh_output_path(outdir / "backbone_utilization_direction_d.pdf")
+    timeseries_activation_path = fresh_output_path(outdir / "backbone_activation_timeline.pdf")
     plot_backbone_timeseries(
         rl_trace=traces["rl"][0],
         greedy_trace=traces["greedy"][0],
@@ -1232,7 +1519,11 @@ def main() -> None:
         moment_t=moment_t,
         node_name=backbone_name,
         threshold=cfg.reward_saturation_threshold,
-        out_path=timeseries_path,
+        out_paths={
+            "c": timeseries_c_path,
+            "d": timeseries_d_path,
+            "activation": timeseries_activation_path,
+        },
     )
     betweenness_path = fresh_output_path(outdir / "node_betweenness_top10.pdf")
     create_betweenness_pdf(
@@ -1244,6 +1535,10 @@ def main() -> None:
 
     geodash_rl_path = fresh_output_path(outdir / "geodash_rl_incident_trace.pdf")
     geodash_adv_path = fresh_output_path(outdir / "geodash_rl_vs_greedy_peak.pdf")
+    directed_map_path = fresh_output_path(outdir / "directed_network_arrows_map.pdf")
+    directed_map_c_path = fresh_output_path(outdir / "directed_network_direction_c_map.pdf")
+    directed_map_d_path = fresh_output_path(outdir / "directed_network_direction_d_map.pdf")
+    incident_nodes_map_path = fresh_output_path(outdir / "incident_nodes_map.pdf")
     peak_t = find_peak_incident_step(traces["rl"][0], traces["greedy"][0])
     create_incident_trace_pdf(
         dataset=dataset,
@@ -1261,6 +1556,26 @@ def main() -> None:
         backbone_idx=backbone_idx,
         peak_t=peak_t,
         out_path=geodash_adv_path,
+    )
+    plot_directed_network_arrows_map(
+        dataset=dataset,
+        out_path=directed_map_path,
+    )
+    plot_directed_network_single_direction_map(
+        dataset=dataset,
+        direction="C",
+        out_path=directed_map_c_path,
+    )
+    plot_directed_network_single_direction_map(
+        dataset=dataset,
+        direction="D",
+        out_path=directed_map_d_path,
+    )
+    plot_incident_nodes_map(
+        dataset=dataset,
+        static=static,
+        mapped_incidents=mapped_incidents,
+        out_path=incident_nodes_map_path,
     )
 
     stress_rows, per_scale_metrics = build_stress_test_rows(
@@ -1305,10 +1620,16 @@ def main() -> None:
         f"Peak incident map step: t={peak_t}",
         f"Pareto plot: {pareto_path}",
         f"Cumulative reward plot: {cumulative_path}",
-        f"Backbone time-series plot: {timeseries_path}",
+        f"Backbone time-series (Dir C): {timeseries_c_path}",
+        f"Backbone time-series (Dir D): {timeseries_d_path}",
+        f"Backbone activation timeline: {timeseries_activation_path}",
         f"Node betweenness top-10 plot: {betweenness_path}",
         f"RL incident trace geodash: {geodash_rl_path}",
         f"RL vs Greedy peak geodash: {geodash_adv_path}",
+        f"Directed network arrows map: {directed_map_path}",
+        f"Directed map (Direction C): {directed_map_c_path}",
+        f"Directed map (Direction D): {directed_map_d_path}",
+        f"Incident nodes map: {incident_nodes_map_path}",
         f"LaTeX tables: {latex_path}",
     ]
     (outdir / "report_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
