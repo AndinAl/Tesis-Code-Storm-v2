@@ -1,0 +1,43 @@
+Report Artifacts Last Run Parameters
+Date: 2026-04-04
+Entrypoint: python -m stim_gnn_dqn.report_artifacts
+Checkpoint used: Model/outputs/final_optuna_full/best_q_net.pt
+Output dir: Model/outputs/paper_assets
+Config source: Model/stim_gnn_dqn/config.py
+
+Key parameters (current defaults):
+- horizon=24
+- history_len=4
+- train_ratio=0.70
+- val_ratio=0.15
+- validation_start=2024-04-30 02:30:00
+- validation_end=2024-06-22 19:14:00
+- reward_alpha=0.01
+- reward_beta=5.0
+- reward_kappa=0.15
+- reward_eta=5.0
+- reward_deactivation_lambda=0.10
+- reward_saturation_threshold=0.72
+- reward_saturation_weight=5.0
+- max_budget=10
+- hidden_dim=64
+- gnn_layers=3
+- gconv_hops_k=None
+- dqn_lookahead_h=3
+- episodes=180
+- lr=1e-4
+- lr_min=1e-5
+- batch_size=64
+- target_update_tau=0.005
+- max_grad_norm=1.0
+- epsilon_decay_steps=5000
+- train_window_hours=12
+- baseline_lookahead_h=1
+- expected_directed_edges=852
+- report_reward_normalization_edges=852
+
+Data paths:
+- network_json=Data/data/network.json
+- imputed_flow_npz=Model/outputs_imputation/imputed_edge_flow_matrix.npz
+- incident_events_xlsx=Data/data/ocorrencias-interdicoes_rs_chuvas_2024.xlsx
+- incident_metadata_csv=Model/outputs_imputation/imputed_edge_metadata.csv
