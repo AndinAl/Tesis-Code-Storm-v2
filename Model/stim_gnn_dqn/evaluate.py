@@ -7,7 +7,12 @@ from statistics import mean
 import numpy as np
 import torch
 
-from .baselines import greedy_coverage_policy, random_policy, static_degree_policy
+from .baselines import (
+    greedy_coverage_policy,
+    lookahead_greedy_policy,
+    random_policy,
+    static_degree_policy,
+)
 from .config import Config
 from .data_loader import build_dataset
 from .environment import CapacityConstrainedEnv
@@ -43,6 +48,8 @@ def run_episode(
     q_net: GNNQNetwork | None,
     start_t: int,
     incident_schedule: torch.FloatTensor | None = None,
+    lookahead_h: int = 6,
+    lookahead_gamma: float = 0.99,
 ):
     if policy_name == "storm":
         state = env.reset(start_t, incident_schedule=make_storm_schedule(env, factor=0.6))
@@ -60,6 +67,14 @@ def run_episode(
             action = random_policy(state, env.max_budget)
         elif policy_name == "greedy":
             action = greedy_coverage_policy(env, state, env.max_budget)
+        elif policy_name == "lookahead":
+            action = lookahead_greedy_policy(
+                env,
+                state,
+                env.max_budget,
+                lookahead_h=lookahead_h,
+                gamma=lookahead_gamma,
+            )
         elif policy_name == "degree":
             action = static_degree_policy(env, state, env.max_budget)
         else:
@@ -161,8 +176,8 @@ def main() -> None:
     else:
         print("Warning: trained model not found. RL evaluation will use random weights.")
 
-    policies = ["random", "greedy", "degree", "rl", "storm"]
-    shared_schedule_policies = ["random", "greedy", "degree", "rl"]
+    policies = ["random", "greedy", "lookahead", "degree", "rl", "storm"]
+    shared_schedule_policies = ["random", "greedy", "lookahead", "degree", "rl"]
     stress_test_policies = ["storm"]
     results = {name: [] for name in policies}
 
@@ -208,7 +223,15 @@ def main() -> None:
             shared_schedule = env.sample_incident_schedule()
         for name in policies:
             policy_schedule = None if name == "storm" else shared_schedule
-            metrics = run_episode(env, name, q_net, start_t, incident_schedule=policy_schedule)
+            metrics = run_episode(
+                env,
+                name,
+                q_net,
+                start_t,
+                incident_schedule=policy_schedule,
+                lookahead_h=cfg.greedy_lookahead_h,
+                lookahead_gamma=cfg.greedy_lookahead_gamma,
+            )
             results[name].append(metrics)
 
     print_summary("Shared-Schedule Policy Comparison", shared_schedule_policies, results)

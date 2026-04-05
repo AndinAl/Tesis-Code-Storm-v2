@@ -18,7 +18,12 @@ from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 from matplotlib.transforms import Bbox
 
-from .baselines import greedy_coverage_policy, random_policy, static_degree_policy
+from .baselines import (
+    greedy_coverage_policy,
+    lookahead_greedy_policy,
+    random_policy,
+    static_degree_policy,
+)
 from .config import Config
 from .data_loader import STIMDataset, build_dataset
 from .environment import CapacityConstrainedEnv
@@ -181,6 +186,8 @@ def choose_action(
     state,
     policy_name: str,
     q_net: GNNQNetwork | None,
+    lookahead_h: int = 6,
+    lookahead_gamma: float = 0.99,
 ) -> List[int]:
     if policy_name == "rl":
         assert q_net is not None
@@ -189,6 +196,14 @@ def choose_action(
         return random_policy(state, env.max_budget)
     if policy_name == "greedy":
         return greedy_coverage_policy(env, state, env.max_budget)
+    if policy_name == "lookahead":
+        return lookahead_greedy_policy(
+            env,
+            state,
+            env.max_budget,
+            lookahead_h=lookahead_h,
+            gamma=lookahead_gamma,
+        )
     if policy_name == "degree":
         return static_degree_policy(env, state, env.max_budget)
     raise ValueError(policy_name)
@@ -225,6 +240,8 @@ def run_episode_trace(
     start_t: int,
     incident_schedule: torch.FloatTensor | None = None,
     reward_norm_edges: int | None = None,
+    lookahead_h: int = 6,
+    lookahead_gamma: float = 0.99,
 ) -> EpisodeTrace:
     if policy_name == "storm":
         state = env.reset(start_t, incident_schedule=make_storm_schedule(env, factor=0.6))
@@ -256,7 +273,14 @@ def run_episode_trace(
         t_before = env.current_t
         step_before = env.step_idx
         prev_active_mask = env.active_mask.clone()
-        action = choose_action(env, state, inner_policy, q_net)
+        action = choose_action(
+            env,
+            state,
+            inner_policy,
+            q_net,
+            lookahead_h=lookahead_h,
+            lookahead_gamma=lookahead_gamma,
+        )
         next_state, out = env.step(action)
 
         step_reward = out.reward * reward_scale
@@ -344,7 +368,7 @@ def collect_policy_runs(
     scaled_dataset = clone_dataset_with_flow_scale(dataset, flow_scale)
     env = build_env(cfg, scaled_dataset, static, device)
     starts = static.val_starts if cfg.eval_split == "val" else static.test_starts
-    policies = ["random", "greedy", "degree", "rl"] + (["storm"] if include_storm else [])
+    policies = ["random", "greedy", "lookahead", "degree", "rl"] + (["storm"] if include_storm else [])
     results = {name: [] for name in policies}
 
     for start_t in starts[: cfg.eval_episodes]:
@@ -367,6 +391,8 @@ def collect_policy_runs(
                 start_t,
                 incident_schedule=schedule,
                 reward_norm_edges=reward_norm_edges,
+                lookahead_h=cfg.greedy_lookahead_h,
+                lookahead_gamma=cfg.greedy_lookahead_gamma,
             )
             results[name].append(trace)
 
@@ -498,6 +524,7 @@ def plot_pareto_frontier(
         "random": "o",
         "degree": "s",
         "greedy": "D",
+        "lookahead": "X",
         "rl": "P",
         "storm": "^",
     }
@@ -568,6 +595,7 @@ def plot_cumulative_reward(
         "random": "#8c8c8c",
         "degree": "#2c7fb8",
         "greedy": "#d95f02",
+        "lookahead": "#8e44ad",
         "rl": "#1b9e77",
         "storm": "#7570b3",
     }
@@ -1265,10 +1293,11 @@ def create_advantage_pdf(
     dataset: STIMDataset,
     static: StaticParameters,
     rl_trace: EpisodeTrace,
-    greedy_trace: EpisodeTrace,
+    baseline_trace: EpisodeTrace,
     backbone_idx: int,
     peak_t: int,
     out_path: Path,
+    baseline_label: str = "Greedy",
 ) -> None:
     map_legend = _map_legend_handles()
     fig, axes = plt.subplots(1, 2, figsize=(FULL_WIDTH_IN, 3.25), constrained_layout=False)
@@ -1288,10 +1317,10 @@ def create_advantage_pdf(
         axes[1],
         dataset,
         static,
-        greedy_trace,
+        baseline_trace,
         peak_t,
         backbone_idx,
-        title=f"Greedy, t={peak_t}",
+        title=f"{baseline_label}, t={peak_t}",
         highlight_incidents=True,
         show_axis_labels=True,
         show_incident_count_label=True,
@@ -1324,9 +1353,16 @@ def write_latex_tables(
     lines.append("\\toprule")
     lines.append("Policy & $J$ & $J_{int}$ & MTTD & $\\phi$ & $S$ & $\\rho_C/\\rho_D$ & $\\Delta_{dir}$ \\\\")
     lines.append("\\midrule")
-    for policy_name in ["random", "degree", "greedy", "rl"]:
+    for policy_name in ["random", "degree", "greedy", "lookahead", "rl"]:
+        if policy_name not in metrics:
+            continue
         vals = metrics[policy_name]
-        label = "RL (SMA)" if policy_name == "rl" else policy_name.capitalize()
+        if policy_name == "rl":
+            label = "RL (SMA)"
+        elif policy_name == "lookahead":
+            label = "Look-Ahead Greedy"
+        else:
+            label = policy_name.capitalize()
         lines.append(
             f"{label} & {format_float(vals['J'])} & {format_float(vals['J_int'])} & "
             f"{format_float(vals['MTTD'])} & {format_float(vals['phi'])} & "
@@ -1415,17 +1451,19 @@ def build_stress_test_rows(
         per_scale_metrics[str(scale)] = aggregate_policy_metrics(traces, cfg.reward_saturation_threshold, dataset)
 
     rl_base = per_scale_metrics["1.0"]["rl"]["J_int"]
-    greedy_base = per_scale_metrics["1.0"]["greedy"]["J_int"]
+    baseline_key = "lookahead" if "lookahead" in per_scale_metrics["1.0"] else "greedy"
+    baseline_base = per_scale_metrics["1.0"][baseline_key]["J_int"]
     rows: List[dict[str, float]] = []
     for scale in scales:
         metrics = per_scale_metrics[str(scale)]
         rl_retention = 100.0 * metrics["rl"]["J_int"] / max(rl_base, 1e-6)
-        baseline_retention = 100.0 * metrics["greedy"]["J_int"] / max(greedy_base, 1e-6)
+        baseline_retention = 100.0 * metrics[baseline_key]["J_int"] / max(baseline_base, 1e-6)
         rl_skew = float(metrics["rl"]["saturation_skew"])
-        baseline_skew = float(metrics["greedy"]["saturation_skew"])
+        baseline_skew = float(metrics[baseline_key]["saturation_skew"])
         rows.append(
             {
                 "label": labels[scale],
+                "baseline_name": baseline_key,
                 "rl_retention": rl_retention,
                 "baseline_retention": baseline_retention,
                 "delta": rl_retention - baseline_retention,
@@ -1492,7 +1530,7 @@ def main() -> None:
     pareto_path = fresh_output_path(outdir / "pareto_frontier.pdf")
     plot_pareto_frontier(metrics, pareto_path)
 
-    shared_episode_runs = {name: traces[name][0] for name in ["random", "degree", "greedy", "rl", "storm"]}
+    shared_episode_runs = {name: traces[name][0] for name in ["random", "degree", "greedy", "lookahead", "rl", "storm"]}
     cumulative_path = fresh_output_path(outdir / "cumulative_reward_comparison.pdf")
     plot_cumulative_reward(
         shared_episode_runs,
@@ -1502,9 +1540,13 @@ def main() -> None:
         reward_norm_edges=cfg.report_reward_normalization_edges,
     )
 
+    baseline_key = "lookahead" if "lookahead" in traces else "greedy"
+    baseline_trace = traces[baseline_key][0]
+    baseline_label = "Look-Ahead Greedy" if baseline_key == "lookahead" else "Greedy"
+
     backbone_idx, moment_t = find_backbone_advantage(
         rl_trace=traces["rl"][0],
-        greedy_trace=traces["greedy"][0],
+        greedy_trace=baseline_trace,
         static=static,
         threshold=cfg.reward_saturation_threshold,
     )
@@ -1514,7 +1556,7 @@ def main() -> None:
     timeseries_activation_path = fresh_output_path(outdir / "backbone_activation_timeline.pdf")
     plot_backbone_timeseries(
         rl_trace=traces["rl"][0],
-        greedy_trace=traces["greedy"][0],
+        greedy_trace=baseline_trace,
         node_idx=backbone_idx,
         moment_t=moment_t,
         node_name=backbone_name,
@@ -1534,12 +1576,12 @@ def main() -> None:
     )
 
     geodash_rl_path = fresh_output_path(outdir / "geodash_rl_incident_trace.pdf")
-    geodash_adv_path = fresh_output_path(outdir / "geodash_rl_vs_greedy_peak.pdf")
+    geodash_adv_path = fresh_output_path(outdir / f"geodash_rl_vs_{baseline_key}_peak.pdf")
     directed_map_path = fresh_output_path(outdir / "directed_network_arrows_map.pdf")
     directed_map_c_path = fresh_output_path(outdir / "directed_network_direction_c_map.pdf")
     directed_map_d_path = fresh_output_path(outdir / "directed_network_direction_d_map.pdf")
     incident_nodes_map_path = fresh_output_path(outdir / "incident_nodes_map.pdf")
-    peak_t = find_peak_incident_step(traces["rl"][0], traces["greedy"][0])
+    peak_t = find_peak_incident_step(traces["rl"][0], baseline_trace)
     create_incident_trace_pdf(
         dataset=dataset,
         static=static,
@@ -1552,10 +1594,11 @@ def main() -> None:
         dataset=dataset,
         static=static,
         rl_trace=traces["rl"][0],
-        greedy_trace=traces["greedy"][0],
+        baseline_trace=baseline_trace,
         backbone_idx=backbone_idx,
         peak_t=peak_t,
         out_path=geodash_adv_path,
+        baseline_label=baseline_label,
     )
     plot_directed_network_arrows_map(
         dataset=dataset,
@@ -1594,7 +1637,9 @@ def main() -> None:
         "scale,policy,J_int,MTTD,saturation_rate,saturation_rate_c,saturation_rate_d,util_mean_c,util_mean_d,saturation_skew"
     ]
     for scale, scale_metrics in per_scale_metrics.items():
-        for policy_name in ["greedy", "rl"]:
+        for policy_name in [baseline_key, "rl"]:
+            if policy_name not in scale_metrics:
+                continue
             vals = scale_metrics[policy_name]
             stress_lines.append(
                 ",".join(
@@ -1625,7 +1670,7 @@ def main() -> None:
         f"Backbone activation timeline: {timeseries_activation_path}",
         f"Node betweenness top-10 plot: {betweenness_path}",
         f"RL incident trace geodash: {geodash_rl_path}",
-        f"RL vs Greedy peak geodash: {geodash_adv_path}",
+        f"RL vs {baseline_label} peak geodash: {geodash_adv_path}",
         f"Directed network arrows map: {directed_map_path}",
         f"Directed map (Direction C): {directed_map_c_path}",
         f"Directed map (Direction D): {directed_map_d_path}",

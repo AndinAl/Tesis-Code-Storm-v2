@@ -104,6 +104,10 @@ class Config:
     # Evaluation
     eval_split: str = "val"
     eval_episodes: int = 4
+    # Strict baseline parity: look-ahead greedy uses the same discounting
+    # perspective as RL over a finite H-step planning window.
+    greedy_lookahead_h: int = 6
+    greedy_lookahead_gamma: float = 0.99
     # Directional model guardrail for RS imputed output.
     expected_directed_edges: int | None = 852
     # Reporting-only normalization to keep reward magnitudes comparable with
