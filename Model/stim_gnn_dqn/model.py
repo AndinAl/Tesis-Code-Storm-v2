@@ -52,14 +52,30 @@ class AttentionMessagePassingLayer(nn.Module):
 
 
 class GNNQNetwork(nn.Module):
-    def __init__(self, node_in_dim: int, edge_in_dim: int, hidden_dim: int, gnn_layers: int) -> None:
+    def __init__(
+        self,
+        node_in_dim: int,
+        edge_in_dim: int,
+        hidden_dim: int,
+        gnn_layers: int,
+        global_context_dim: int = 0,
+        # Backward-compatible alias used by older scripts.
+        global_temporal_dim: int | None = None,
+        # Backward-compatible no-op alias used by older scripts.
+        spatial_hops: int | None = None,
+    ) -> None:
         super().__init__()
+        del spatial_hops
+        if global_temporal_dim is not None and global_context_dim <= 0:
+            global_context_dim = int(global_temporal_dim)
+        self.global_context_dim = max(0, int(global_context_dim))
         self.node_proj = nn.Linear(node_in_dim, hidden_dim)
         self.layers = nn.ModuleList(
             [AttentionMessagePassingLayer(hidden_dim, edge_in_dim) for _ in range(gnn_layers)]
         )
+        q_in_dim = hidden_dim + self.global_context_dim
         self.q_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(q_in_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -68,6 +84,18 @@ class GNNQNetwork(nn.Module):
         h = F.relu(self.node_proj(state.x))
         for layer in self.layers:
             h = layer(h, state.edge_index, state.edge_attr)
+        if self.global_context_dim > 0:
+            if state.global_context is None:
+                context = torch.zeros((self.global_context_dim,), dtype=h.dtype, device=h.device)
+            else:
+                context = state.global_context.to(h.device, dtype=h.dtype).reshape(-1)
+                if context.numel() < self.global_context_dim:
+                    pad = torch.zeros((self.global_context_dim - context.numel(),), dtype=h.dtype, device=h.device)
+                    context = torch.cat([context, pad], dim=0)
+                elif context.numel() > self.global_context_dim:
+                    context = context[: self.global_context_dim]
+            context_expanded = context.unsqueeze(0).expand(h.shape[0], -1)
+            h = torch.cat([h, context_expanded], dim=1)
         return self.q_head(h).squeeze(-1)
 
 

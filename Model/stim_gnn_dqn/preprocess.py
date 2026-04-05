@@ -22,6 +22,15 @@ class StaticParameters:
     outdegree_norm: torch.FloatTensor
     community_norm: torch.FloatTensor
     gateway_norm: torch.FloatTensor
+    # Residual baseline tensor mu[h, d] per directed edge:
+    # shape [2 (weekday/weekend), 24 hours, num_edges].
+    residual_mu_by_day_hour: torch.FloatTensor
+    # Cached timestamp decomposition for fast residual lookup during rollouts.
+    time_hour_idx: torch.LongTensor
+    time_daytype_idx: torch.LongTensor
+    # Time-regime one-hot vectors per timestep:
+    # [early_morning, morning_peak, midday, evening_peak, night].
+    time_regime_onehot: torch.FloatTensor
     train_starts: List[int]
     val_starts: List[int]
     test_starts: List[int]
@@ -35,6 +44,66 @@ def _normalize(x: torch.Tensor) -> torch.Tensor:
     x = x.float()
     denom = torch.clamp(x.max() - x.min(), min=1e-6)
     return (x - x.min()) / denom
+
+
+def _extract_hour_daytype(
+    dataset: STIMDataset,
+    horizon: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-step hour index and day-type index (0 weekday, 1 weekend)."""
+    if dataset.timestamps is None:
+        hour_idx = (np.arange(dataset.num_steps, dtype=np.int64) % max(1, horizon)).astype(np.int64)
+        daytype_idx = np.zeros(dataset.num_steps, dtype=np.int64)
+        return hour_idx, daytype_idx
+
+    ts_hour = np.asarray(dataset.timestamps).astype("datetime64[h]")
+    ts_day = np.asarray(dataset.timestamps).astype("datetime64[D]")
+    # 1970-01-01 is Thursday -> Monday=0 conversion offset is +3.
+    dow = (ts_day.astype(np.int64) + 3) % 7
+    daytype_idx = (dow >= 5).astype(np.int64)  # 0 weekday, 1 weekend
+    hour_idx = (ts_hour.astype(np.int64) % 24).astype(np.int64)
+    return hour_idx, daytype_idx
+
+
+def _compute_residual_mu_by_day_hour(
+    dataset: STIMDataset,
+    train_time_idx: list[int],
+    hour_idx: np.ndarray,
+    daytype_idx: np.ndarray,
+) -> torch.FloatTensor:
+    """Compute mu(h,d) baseline per directed edge from training timesteps."""
+    flows_np = dataset.flows.detach().cpu().numpy().astype(np.float32)
+    num_edges = dataset.num_edges
+    mu = np.zeros((2, 24, num_edges), dtype=np.float64)
+    cnt = np.zeros((2, 24), dtype=np.int64)
+
+    for t in train_time_idx:
+        d = int(daytype_idx[t])
+        h = int(hour_idx[t])
+        mu[d, h] += flows_np[t]
+        cnt[d, h] += 1
+
+    global_edge_mean = flows_np[train_time_idx].mean(axis=0) if train_time_idx else flows_np.mean(axis=0)
+    for d in range(2):
+        for h in range(24):
+            if cnt[d, h] > 0:
+                mu[d, h] /= float(cnt[d, h])
+            else:
+                mu[d, h] = global_edge_mean
+
+    return torch.tensor(mu.astype(np.float32), dtype=torch.float32)
+
+
+def _compute_time_regime_onehot(hour_idx: np.ndarray) -> torch.FloatTensor:
+    """Map hour -> regime and return one-hot [num_steps, 5]."""
+    regime_idx = np.full(hour_idx.shape, 4, dtype=np.int64)  # default night
+    regime_idx[(hour_idx >= 0) & (hour_idx <= 5)] = 0  # early_morning
+    regime_idx[(hour_idx >= 6) & (hour_idx <= 9)] = 1  # morning_peak
+    regime_idx[(hour_idx >= 10) & (hour_idx <= 15)] = 2  # midday
+    regime_idx[(hour_idx >= 16) & (hour_idx <= 19)] = 3  # evening_peak
+    regime_idx[(hour_idx >= 20) & (hour_idx <= 23)] = 4  # night
+    onehot = np.eye(5, dtype=np.float32)[regime_idx]
+    return torch.tensor(onehot, dtype=torch.float32)
 
 
 def build_static_parameters(
@@ -117,6 +186,15 @@ def build_static_parameters(
         [_normalize(dataset.coords[:, 0]), _normalize(dataset.coords[:, 1])], dim=1
     )
 
+    hour_idx, daytype_idx = _extract_hour_daytype(dataset=dataset, horizon=horizon)
+    residual_mu = _compute_residual_mu_by_day_hour(
+        dataset=dataset,
+        train_time_idx=train_time_idx,
+        hour_idx=hour_idx,
+        daytype_idx=daytype_idx,
+    )
+    time_regime_onehot = _compute_time_regime_onehot(hour_idx=hour_idx)
+
     return StaticParameters(
         capacity=capacity,
         inbound_capacity=inbound_capacity,
@@ -129,6 +207,10 @@ def build_static_parameters(
         outdegree_norm=_normalize(dataset.outdegree),
         community_norm=_normalize(dataset.community_ids.float()),
         gateway_norm=_normalize(dataset.betweenness_centrality),
+        residual_mu_by_day_hour=residual_mu,
+        time_hour_idx=torch.tensor(hour_idx, dtype=torch.long),
+        time_daytype_idx=torch.tensor(daytype_idx, dtype=torch.long),
+        time_regime_onehot=time_regime_onehot,
         train_starts=train_starts,
         val_starts=val_starts,
         test_starts=test_starts,

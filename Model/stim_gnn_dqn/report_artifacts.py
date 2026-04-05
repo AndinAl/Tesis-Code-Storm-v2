@@ -163,6 +163,9 @@ def load_model(cfg: Config, env: CapacityConstrainedEnv, device: str) -> GNNQNet
         edge_in_dim=sample_state.edge_attr.shape[1],
         hidden_dim=cfg.hidden_dim,
         gnn_layers=cfg.gnn_layers,
+        global_context_dim=(
+            int(sample_state.global_context.numel()) if sample_state.global_context is not None else 0
+        ),
     ).to(device)
     best_model_path = cfg.workdir_path / "best_q_net.pt"
     model_path = best_model_path if best_model_path.exists() else (cfg.workdir_path / "q_net.pt")

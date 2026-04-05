@@ -49,12 +49,15 @@ class GraphState:
     edge_index: torch.LongTensor
     edge_attr: torch.FloatTensor
     global_t: int
+    # Global context vector for policy head (time regime one-hot).
+    global_context: torch.FloatTensor | None = None
 
     def clone(self) -> "GraphState":
         return GraphState(
             x=self.x.clone().detach(),
             edge_index=self.edge_index.clone().detach(),
             edge_attr=self.edge_attr.clone().detach(),
+            global_context=self.global_context.clone().detach() if self.global_context is not None else None,
             global_t=int(self.global_t),
         )
 
@@ -187,6 +190,12 @@ class CapacityConstrainedEnv:
         scale = self.episode_capacity_scale[min(self.step_idx, self.horizon - 1)]
         return self.static.capacity * scale
 
+    def _current_residual_baseline(self, t: int) -> torch.Tensor:
+        t_idx = min(max(0, int(t)), self.dataset.num_steps - 1)
+        hour_idx = int(self.static.time_hour_idx[t_idx].item())
+        daytype_idx = int(self.static.time_daytype_idx[t_idx].item())
+        return self.static.residual_mu_by_day_hour[daytype_idx, hour_idx]
+
     def _compute_saturation_penalty(self) -> float:
         diff = self.prev_inbound_ratio - self.reward_saturation_threshold
         stress_penalty = torch.where(
@@ -223,6 +232,8 @@ class CapacityConstrainedEnv:
     def _build_state(self) -> GraphState:
         t = min(self.current_t, self.dataset.num_steps - 1)
         flow_t = self.dataset.flows[t]
+        residual_mu = self._current_residual_baseline(t)
+        residual_flow = flow_t - residual_mu
         flow_hist = self._history_tensor(flow_t)
         dyn_cap = self._current_dynamic_capacity()
 
@@ -240,6 +251,7 @@ class CapacityConstrainedEnv:
         edge_attr_normalized = torch.stack(
             [
                 flow_t / torch.clamp(self.dataset.flows.max(), min=1e-6),
+                torch.tanh(residual_flow / torch.clamp(self.dataset.flows.max(), min=1e-6)),
                 hist_mean / torch.clamp(self.dataset.flows.max(), min=1e-6),
                 hist_std / torch.clamp(self.dataset.flows.max(), min=1e-6),
                 self.static.capacity_norm,
@@ -271,11 +283,13 @@ class CapacityConstrainedEnv:
             dim=1,
         )
         node_x = torch.cat([dynamic_features, structural_features], dim=1)
+        regime_onehot = self.static.time_regime_onehot[t]
 
         return GraphState(
             x=node_x.to(self.device),
             edge_index=self.dataset.edge_index.to(self.device),
             edge_attr=edge_attr_normalized.to(self.device),
+            global_context=regime_onehot.to(self.device),
             global_t=t,
         )
 
