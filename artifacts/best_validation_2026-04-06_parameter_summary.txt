@@ -1,0 +1,169 @@
+Best Validation Parameter Summary (Latest Simulation)
+====================================================
+Date: 2026-04-06
+
+Run Scope
+---------
+- This file summarizes the most recent pipeline runs for both horizons:
+  - H=12 -> Model/outputs/final_optuna_h12
+  - H=24 -> Model/outputs/final_optuna_h24
+- Optuna tuning folders:
+  - H=12 -> Model/outputs/optuna_h12
+  - H=24 -> Model/outputs/optuna_h24
+
+Shared Data Inputs
+------------------
+- network_json: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Data/data/network.json
+- imputed_flow_npz: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Model/outputs_imputation/imputed_edge_flow_matrix.npz
+- incident_events_xlsx: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Data/data/ocorrencias-interdicoes_rs_chuvas_2024.xlsx
+- incident_metadata_csv: /home/andina/Tesis_storm_v2/Tesis Code Storm v2/Model/outputs_imputation/imputed_edge_metadata.csv
+
+Shared Training/Eval Settings
+-----------------------------
+- train_ratio: 0.70
+- val_ratio: 0.15
+- validation window: 2024-04-30 02:30:00 to 2024-06-22 19:14:00
+- reward_alpha: 0.01
+- max_budget: 10
+- episodes: 180
+- batch_size: 64
+- gamma: 0.99
+- eval_episodes: 4
+- expected_directed_edges: 852
+
+Baseline Policies and Parameters
+--------------------------------
+Evaluation policy set:
+- Shared-schedule comparison: random, greedy, lookahead, degree, rl
+- Storm stress row: storm (RL under synthetic storm schedule)
+
+Common baseline constraints:
+- max_budget: 10 (all baseline policies capped by the same cardinality limit)
+- seed: 7 (random/NumPy/Torch seeded in evaluate script)
+- shared incident schedule: same sampled/real schedule reused across random/greedy/lookahead/degree/rl per episode
+- incident schedule sampling params (when not using mapped real incidents):
+  - incident_prob_eval: 1.0
+  - incident_factor_low/high: 0.2 / 0.6
+  - incident_duration_min/max: 2 / 6
+  - incident_edge_fraction: 0.10
+
+Policy-specific definitions:
+- random:
+  - budget ~ Uniform integer in [0, max_budget]
+  - selected nodes sampled uniformly without replacement
+- greedy:
+  - one-hop immediate influence score per source node
+  - score_i uses effective edge flow min(flow_t, dyn_cap_t) scaled by destination threshold
+  - dynamic budget chosen by prefix objective: cumulative normalized score - reward_zeta * budget
+  - reward_zeta (prefix cost weight): 0.05
+- degree:
+  - score_i = outdegree_i
+  - same dynamic prefix budget rule as greedy
+  - reward_zeta (prefix cost weight): 0.05
+- lookahead:
+  - candidate actions are greedy-ranked prefixes from budget 0..max_budget
+  - chooses action with highest simulated discounted return over H steps
+  - lookahead_h (used in latest strict baseline comparisons):
+    - H=12 comparison: 4
+    - H=24 comparison: 2
+  - config default remains: cfg.greedy_lookahead_h = 6
+  - lookahead_gamma: cfg.greedy_lookahead_gamma = 0.99
+  - rollout assumes no additional interventions after first step for candidate evaluation
+- storm:
+  - uses RL policy with synthetic storm schedule (not a separate baseline policy head)
+  - storm factor: 0.6
+  - storm start: horizon // 2
+  - storm duration: min(6, horizon // 3)
+  - affected edges: top-capacity edges within configured incident edge fraction
+
+Note on strict lookahead rerun:
+- Separate strict files used for these lookahead settings:
+  - Model/outputs/h12_regime_rerun_20260405/baseline_comparison_h12_lookahead4.csv
+  - Model/outputs/paper_assets/lookahead_h2_h4_ablation.csv
+
+Horizon = 12
+============
+Optuna best (Model/outputs/optuna_h12/optuna_best_params_full.json)
+--------------------------------------------------------------------
+- n_trials: 50
+- best_value: 139.6
+- reward_kappa: 1.1593881770813121
+- reward_beta: 2.445896928003815
+- reward_eta: 5.1258400666322
+- reward_deactivation_lambda: 0.1481256477676529
+- lr: 5.4350223841180935e-05
+- target_update_tau: 0.0013766798660167726
+- epsilon_decay_steps: 6593
+- gnn_layers: 4
+
+Best checkpoint (Model/outputs/final_optuna_h12/best_model_summary.json)
+-------------------------------------------------------------------------
+- best_episode: 175
+- best_val_reward: 10.427698827462477
+- best_model_path: Model/outputs/final_optuna_h12/best_q_net.pt
+
+Policy comparison (validation)
+------------------------------
+Policy      | J       | J_int  | MTTD  | S      | phi   | D     | B
+------------|---------|--------|-------|--------|-------|-------|-------
+random      | -6.503  | 65.50  | 1.025 | 0.0138 | 0.143 | 4.708 | 5.229
+greedy      | 37.925  | 148.75 | 3.379 | 0.0314 | 0.087 | 2.875 | 10.000
+lookahead   | 17.013  | 61.50  | 3.072 | 0.0130 | 0.022 | 0.729 | 3.417
+lookahead*  | 6.653   | 49.00  | 2.496 | 0.0103 | 0.025 | 0.812 | 2.854
+degree      | 46.788  | 124.25 | 6.500 | 0.0262 | 0.004 | 0.125 | 10.000
+rl          | 28.761  | 120.75 | 2.610 | 0.0255 | 0.080 | 2.646 | 10.000
+
+Storm row (H=12)
+----------------
+- storm: J=27.634, J_int=120.25, MTTD=2.429, S=0.0254, phi=0.085, D=2.792, B=10.0
+
+Horizon = 24
+============
+Optuna best (Model/outputs/optuna_h24/optuna_best_params_full.json)
+--------------------------------------------------------------------
+- n_trials: 50
+- best_value: 390.8
+- reward_kappa: 3.8617526205049657
+- reward_beta: 4.787549793112911
+- reward_eta: 8.622009155750815
+- reward_deactivation_lambda: 0.07596609992928831
+- lr: 0.00012471658629163403
+- target_update_tau: 0.0064954570173272495
+- epsilon_decay_steps: 5087
+- gnn_layers: 2
+
+Best checkpoint (Model/outputs/final_optuna_h24/best_model_summary.json)
+-------------------------------------------------------------------------
+- best_episode: 25
+- best_val_reward: 46.0329960038475
+- best_model_path: Model/outputs/final_optuna_h24/best_q_net.pt
+
+Policy comparison (validation)
+------------------------------
+Policy      | J       | J_int  | MTTD   | S      | phi   | D     | B
+------------|---------|--------|--------|--------|-------|-------|-------
+random      | -13.758 | 116.75 | 1.010  | 0.0123 | 0.271 | 4.458 | 4.656
+greedy      | 37.460  | 305.25 | 4.345  | 0.0322 | 0.177 | 2.906 | 10.000
+lookahead   | 6.519   | 55.25  | 2.405  | 0.0058 | 0.024 | 0.396 | 1.604
+lookahead*  | 54.283  | 238.25 | 4.527  | 0.0251 | 0.127 | 2.083 | 7.510
+degree      | 49.840  | 255.25 | 12.500 | 0.0269 | 0.013 | 0.219 | 10.000
+rl          | 47.926  | 240.00 | 12.500 | 0.0253 | 0.000 | 0.000 | 10.000
+
+Storm row (H=24)
+----------------
+- storm: J=47.926, J_int=240.00, MTTD=12.5, S=0.0253, phi=0.0, D=0.0, B=10.0
+
+Data split snapshots
+--------------------
+- H=12 (Model/outputs/final_optuna_h12/data_split_summary.json):
+  - num_steps=38736, train_days=2128, val_days=108, test_days=992
+- H=24 (Model/outputs/final_optuna_h24/data_split_summary.json):
+  - num_steps=38736, train_days=1064, val_days=54, test_days=496
+
+Interpretation (latest)
+-----------------------
+- H=12: Degree has the best J; RL remains competitive but below greedy/degree for J.
+- H=24: Degree has the top J, RL is very close in J and has zero flicker/deactivation in this run.
+- *lookahead rows marked with an asterisk are strict baseline settings requested here:
+  - H=12 with lookahead_h=4
+  - H=24 with lookahead_h=2

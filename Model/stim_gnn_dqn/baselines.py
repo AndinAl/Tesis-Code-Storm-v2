@@ -126,6 +126,14 @@ def _simulate_discounted_return(
             .mean()
             .item()
         )
+        normalized_total_flow, normalized_residual_flow = env._normalized_flow_terms(
+            flow_t=flow_t,
+            dyn_cap=dyn_cap,
+            source_active=source_active,
+            t=sim_current_t,
+        )
+        inbound_ratio = inbound / torch.clamp(env.static.inbound_capacity, min=1e-6)
+        utilization_level = float(inbound_ratio.mean().item())
         reward = env._compute_reward(
             coverage=coverage,
             persistence=persistence,
@@ -133,13 +141,16 @@ def _simulate_discounted_return(
             saturation_penalty=saturation_penalty,
             active_count=active_count,
             cost=cost,
+            normalized_total_flow=normalized_total_flow,
+            normalized_residual_flow=normalized_residual_flow,
+            utilization_level=utilization_level,
         )
         total += discount * float(reward)
         discount *= float(gamma)
 
         sim_visited_mask = torch.maximum(sim_visited_mask, next_active)
         sim_active_mask = next_active
-        sim_prev_inbound_ratio = inbound / torch.clamp(env.static.inbound_capacity, min=1e-6)
+        sim_prev_inbound_ratio = inbound_ratio
         sim_current_t += 1
         sim_step_idx += 1
 

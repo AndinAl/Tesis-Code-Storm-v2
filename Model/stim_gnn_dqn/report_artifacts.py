@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import mean
 from typing import Dict, List
@@ -110,6 +111,16 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def _strict_lookahead_h_for_horizon(horizon: int, default_h: int) -> int:
+    """Use strict look-ahead settings requested for baseline parity plots."""
+    h = int(horizon)
+    if h == 12:
+        return 4
+    if h == 24:
+        return 2
+    return int(default_h)
 
 
 def clone_dataset_with_flow_scale(dataset: STIMDataset, flow_scale: float) -> STIMDataset:
@@ -367,12 +378,14 @@ def collect_policy_runs(
     include_storm: bool = True,
     mapped_incidents=None,
     reward_norm_edges: int | None = None,
+    lookahead_h_override: int | None = None,
 ) -> Dict[str, List[EpisodeTrace]]:
     scaled_dataset = clone_dataset_with_flow_scale(dataset, flow_scale)
     env = build_env(cfg, scaled_dataset, static, device)
     starts = static.val_starts if cfg.eval_split == "val" else static.test_starts
     policies = ["random", "greedy", "lookahead", "degree", "rl"] + (["storm"] if include_storm else [])
     results = {name: [] for name in policies}
+    lookahead_h_value = int(lookahead_h_override) if lookahead_h_override is not None else cfg.greedy_lookahead_h
 
     for start_t in starts[: cfg.eval_episodes]:
         if mapped_incidents is not None and scaled_dataset.timestamps is not None:
@@ -394,7 +407,7 @@ def collect_policy_runs(
                 start_t,
                 incident_schedule=schedule,
                 reward_norm_edges=reward_norm_edges,
-                lookahead_h=cfg.greedy_lookahead_h,
+                lookahead_h=lookahead_h_value,
                 lookahead_gamma=cfg.greedy_lookahead_gamma,
             )
             results[name].append(trace)
@@ -479,14 +492,14 @@ def aggregate_policy_metrics(
 
 def find_backbone_advantage(
     rl_trace: EpisodeTrace,
-    greedy_trace: EpisodeTrace,
+    baseline_trace: EpisodeTrace,
     static: StaticParameters,
     threshold: float,
 ) -> tuple[int, int]:
     rl_util = np.stack([step.utilization for step in rl_trace.steps], axis=0)
-    gr_util = np.stack([step.utilization for step in greedy_trace.steps], axis=0)
+    gr_util = np.stack([step.utilization for step in baseline_trace.steps], axis=0)
     rl_active = np.stack([step.active_mask for step in rl_trace.steps], axis=0)
-    gr_active = np.stack([step.active_mask for step in greedy_trace.steps], axis=0)
+    gr_active = np.stack([step.active_mask for step in baseline_trace.steps], axis=0)
     bet = static.betweenness_norm.detach().cpu().numpy()
     candidate_nodes = np.where(bet >= np.quantile(bet, 0.75))[0]
     if candidate_nodes.size == 0:
@@ -507,12 +520,12 @@ def find_backbone_advantage(
     return best_pair
 
 
-def find_peak_incident_step(rl_trace: EpisodeTrace, greedy_trace: EpisodeTrace) -> int:
+def find_peak_incident_step(rl_trace: EpisodeTrace, baseline_trace: EpisodeTrace) -> int:
     rl_load = np.array(
         [step.saturation_penalty + float(np.mean(step.incident_edge_mask)) for step in rl_trace.steps]
     )
     gr_load = np.array(
-        [step.saturation_penalty + float(np.mean(step.incident_edge_mask)) for step in greedy_trace.steps]
+        [step.saturation_penalty + float(np.mean(step.incident_edge_mask)) for step in baseline_trace.steps]
     )
     peak = int(np.argmax(gr_load + rl_load))
     return peak
@@ -592,6 +605,7 @@ def plot_cumulative_reward(
     reward_alpha: float,
     reward_beta: float,
     reward_norm_edges: int | None = None,
+    focus_baseline: str = "lookahead",
 ) -> None:
     fig, ax = plt.subplots(figsize=(FULL_WIDTH_IN, 3.8), constrained_layout=False)
     palette = {
@@ -606,7 +620,24 @@ def plot_cumulative_reward(
         y = [step.cumulative_reward for step in trace.steps]
         x = np.arange(1, len(y) + 1)
         color = palette.get(name, "#333333")
-        ax.plot(x, y, linewidth=2.4, color=color, label=name.upper())
+        is_primary = name in {"rl", focus_baseline}
+        line_alpha = 1.0 if is_primary else 0.35
+        line_width = 2.5 if is_primary else 1.1
+        line_style = "-" if is_primary else "--"
+        if name == focus_baseline:
+            primary_label = "LOOK-AHEAD GREEDY" if name == "lookahead" else name.upper()
+        else:
+            primary_label = name.upper()
+        legend_label = primary_label if is_primary else f"{name.upper()} (ref)"
+        ax.plot(
+            x,
+            y,
+            linewidth=line_width,
+            linestyle=line_style,
+            color=color,
+            alpha=line_alpha,
+            label=legend_label,
+        )
         ax.scatter([x[-1]], [y[-1]], s=28, color=color, zorder=3)
 
         if name == "rl":
@@ -635,6 +666,16 @@ def plot_cumulative_reward(
     ax.set_xlabel("Snapshot within Episode")
     ax.set_ylabel(r"Cumulative Reward $J$")
     ax.grid(alpha=0.25, linestyle="--")
+    ax.text(
+        0.01,
+        0.98,
+        "Primary comparison: RL vs Look-Ahead Greedy",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=7,
+        bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d0d0d0", "alpha": 0.95},
+    )
     fig.subplots_adjust(bottom=0.22)
     ax.legend(frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.16))
     save_pdf(fig, out_path)
@@ -643,24 +684,25 @@ def plot_cumulative_reward(
 
 def plot_backbone_timeseries(
     rl_trace: EpisodeTrace,
-    greedy_trace: EpisodeTrace,
+    baseline_trace: EpisodeTrace,
     node_idx: int,
     moment_t: int,
     node_name: str,
     threshold: float,
     out_paths: Dict[str, Path],
+    baseline_label: str = "Look-Ahead Greedy",
 ) -> None:
     rl_util_c = np.array([step.utilization_c[node_idx] for step in rl_trace.steps])
-    gr_util_c = np.array([step.utilization_c[node_idx] for step in greedy_trace.steps])
+    gr_util_c = np.array([step.utilization_c[node_idx] for step in baseline_trace.steps])
     rl_util_d = np.array([step.utilization_d[node_idx] for step in rl_trace.steps])
-    gr_util_d = np.array([step.utilization_d[node_idx] for step in greedy_trace.steps])
+    gr_util_d = np.array([step.utilization_d[node_idx] for step in baseline_trace.steps])
     rl_active = np.array([step.active_mask[node_idx] for step in rl_trace.steps])
-    gr_active = np.array([step.active_mask[node_idx] for step in greedy_trace.steps])
+    gr_active = np.array([step.active_mask[node_idx] for step in baseline_trace.steps])
     x = np.arange(len(rl_trace.steps), dtype=np.float32)
 
     # Direction C utilization
     fig_c, ax_c = plt.subplots(figsize=(FULL_WIDTH_IN, 3.1), constrained_layout=True)
-    ax_c.plot(x, gr_util_c, color="#d95f02", linewidth=2.1, label="Greedy (Dir C)")
+    ax_c.plot(x, gr_util_c, color="#d95f02", linewidth=2.1, label=f"{baseline_label} (Dir C)")
     ax_c.plot(x, rl_util_c, color="#1b9e77", linewidth=2.1, label="RL (Dir C)")
     ax_c.axhline(threshold, color="#a50f15", linestyle="--", linewidth=1.3, label="Saturation Threshold")
     ax_c.axvline(moment_t, color="#444444", linestyle=":", linewidth=1.3)
@@ -685,7 +727,7 @@ def plot_backbone_timeseries(
 
     # Direction D utilization
     fig_d, ax_d = plt.subplots(figsize=(FULL_WIDTH_IN, 3.1), constrained_layout=True)
-    ax_d.plot(x, gr_util_d, color="#e6550d", linewidth=2.1, linestyle="--", label="Greedy (Dir D)")
+    ax_d.plot(x, gr_util_d, color="#e6550d", linewidth=2.1, linestyle="--", label=f"{baseline_label} (Dir D)")
     ax_d.plot(x, rl_util_d, color="#31a354", linewidth=2.1, linestyle="--", label="RL (Dir D)")
     ax_d.axhline(threshold, color="#a50f15", linestyle="--", linewidth=1.3)
     ax_d.axvline(moment_t, color="#444444", linestyle=":", linewidth=1.3)
@@ -712,7 +754,7 @@ def plot_backbone_timeseries(
 
     # Activation timeline
     fig_a, ax_bottom = plt.subplots(figsize=(FULL_WIDTH_IN, 2.6), constrained_layout=True)
-    ax_bottom.step(x, gr_active, where="post", color="#d95f02", linewidth=2.0, label="Greedy Active")
+    ax_bottom.step(x, gr_active, where="post", color="#d95f02", linewidth=2.0, label=f"{baseline_label} Active")
     ax_bottom.step(x, rl_active, where="post", color="#1b9e77", linewidth=2.0, label="RL Active")
     ax_bottom.fill_between(x, 0, rl_active, step="post", alpha=0.18, color="#1b9e77")
     ax_bottom.fill_between(x, 0, gr_active, step="post", alpha=0.12, color="#d95f02")
@@ -727,6 +769,336 @@ def plot_backbone_timeseries(
     ax_bottom.legend(frameon=False, ncol=2, loc="upper right")
     save_pdf(fig_a, out_paths["activation"])
     plt.close(fig_a)
+
+
+def _trace_top_k_nodes(trace: EpisodeTrace, k: int) -> tuple[np.ndarray, np.ndarray]:
+    if not trace.steps:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
+    active_mat = np.stack([step.active_mask for step in trace.steps], axis=0)
+    scores = active_mat.mean(axis=0).astype(np.float32)
+    order = np.argsort(-scores)
+    k_eff = max(1, min(int(k), int(order.size)))
+    top_idx = order[:k_eff]
+    return top_idx.astype(np.int64), scores
+
+
+def plot_k_node_location_comparison(
+    dataset: STIMDataset,
+    static: StaticParameters,
+    episode_runs: Dict[str, EpisodeTrace],
+    out_path: Path,
+    k: int,
+    primary_baseline: str = "lookahead",
+) -> None:
+    coords = dataset.coords.detach().cpu().numpy()
+    lat = coords[:, 0]
+    lon = coords[:, 1]
+    policy_order = [name for name in ["rl", primary_baseline, "greedy", "degree", "random"] if name in episode_runs]
+    if not policy_order:
+        return
+
+    rows = int(np.ceil(len(policy_order) / 2.0))
+    cols = 2
+    fig, axes = plt.subplots(rows, cols, figsize=(FULL_WIDTH_IN, 2.8 * rows), constrained_layout=True)
+    axes_arr = np.atleast_1d(axes).reshape(rows, cols)
+    policy_colors = {
+        "rl": "#1b9e77",
+        "lookahead": "#8e44ad",
+        "greedy": "#d95f02",
+        "degree": "#2c7fb8",
+        "random": "#7a7a7a",
+    }
+
+    for panel_idx, ax in enumerate(axes_arr.flat):
+        if panel_idx >= len(policy_order):
+            ax.axis("off")
+            continue
+        name = policy_order[panel_idx]
+        trace = episode_runs[name]
+        color = policy_colors.get(name, "#333333")
+        top_idx, scores = _trace_top_k_nodes(trace, k=k)
+        if top_idx.size == 0:
+            plot_base_map(ax, dataset, static, highlight_top10=False, backbone_idx=None, show_axis_labels=True)
+            ax.set_title(f"{name.upper()} (no active nodes)")
+            continue
+
+        plot_base_map(
+            ax,
+            dataset,
+            static,
+            highlight_top10=False,
+            backbone_idx=None,
+            show_axis_labels=(panel_idx >= (rows - 1) * cols or panel_idx % cols == 0),
+        )
+        sel_scores = scores[top_idx]
+        denom = float(max(1e-6, sel_scores.max()))
+        sizes = 44.0 + 190.0 * (sel_scores / denom)
+        ax.scatter(
+            lon[top_idx],
+            lat[top_idx],
+            s=sizes,
+            c=color,
+            edgecolors="white",
+            linewidths=0.8,
+            alpha=0.9,
+            zorder=6,
+        )
+        # Label only first 3 to avoid clutter/overlap.
+        for rank, node_idx in enumerate(top_idx[:3], start=1):
+            ax.text(
+                lon[node_idx],
+                lat[node_idx],
+                f"{rank}",
+                fontsize=6,
+                ha="center",
+                va="center",
+                bbox={"boxstyle": "round,pad=0.15", "fc": "white", "ec": "#4d4d4d", "alpha": 0.9},
+                zorder=7,
+            )
+
+        title_name = "LOOK-AHEAD GREEDY" if name == "lookahead" else name.upper()
+        mean_sel = float(np.mean(sel_scores))
+        ax.set_title(f"{title_name}: k={len(top_idx)} (mean={mean_sel:.2f})", fontsize=8)
+
+    fig.suptitle(f"Node Location Comparison (k={k})", fontsize=9, y=1.01)
+    save_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def _outputs_root_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "outputs"
+
+
+def _horizon_cfg_from_optuna(base_cfg: Config, horizon: int) -> Config:
+    outputs_root = _outputs_root_path()
+    cfg_h = replace(
+        base_cfg,
+        horizon=int(horizon),
+        workdir=str(outputs_root / f"final_optuna_h{horizon}"),
+    )
+    best_path = outputs_root / f"optuna_h{horizon}" / "optuna_best_params_full.json"
+    if not best_path.exists():
+        return cfg_h
+    try:
+        payload = json.loads(best_path.read_text(encoding="utf-8"))
+        best = payload.get("best_params", {})
+        cfg_h = replace(
+            cfg_h,
+            reward_alpha=0.01,
+            reward_kappa=float(best.get("reward_kappa", cfg_h.reward_kappa)),
+            reward_beta=float(best.get("reward_beta", cfg_h.reward_beta)),
+            reward_eta=float(best.get("reward_eta", cfg_h.reward_eta)),
+            reward_deactivation_lambda=float(
+                best.get("reward_deactivation_lambda", cfg_h.reward_deactivation_lambda)
+            ),
+            gnn_layers=int(best.get("gnn_layers", cfg_h.gnn_layers)),
+        )
+    except Exception:
+        # Fallback to base config if best-params JSON is malformed.
+        pass
+    return cfg_h
+
+
+def _collect_horizon_rl_vs_lookahead(
+    base_cfg: Config,
+    dataset: STIMDataset,
+    mapped_incidents,
+    device: str,
+    horizon: int,
+) -> dict | None:
+    cfg_h = _horizon_cfg_from_optuna(base_cfg, horizon)
+    static_h = build_static_parameters(
+        dataset=dataset,
+        horizon=cfg_h.horizon,
+        train_ratio=cfg_h.train_ratio,
+        val_ratio=cfg_h.val_ratio,
+        q=cfg_h.capacity_quantile,
+        threshold_alpha=cfg_h.threshold_alpha,
+        validation_start=cfg_h.validation_start,
+        validation_end=cfg_h.validation_end,
+    )
+    starts = static_h.val_starts if cfg_h.eval_split == "val" else static_h.test_starts
+    if not starts:
+        return None
+
+    env_h = build_env(cfg_h, dataset, static_h, device)
+    q_net_h = load_model(cfg_h, env_h, device)
+    start_t = starts[0]
+    lookahead_h_value = _strict_lookahead_h_for_horizon(cfg_h.horizon, cfg_h.greedy_lookahead_h)
+
+    if mapped_incidents is not None and dataset.timestamps is not None:
+        shared_schedule = build_incident_schedule_for_episode(
+            start_t=start_t,
+            horizon=cfg_h.horizon,
+            num_edges=dataset.num_edges,
+            timestamps=dataset.timestamps,
+            mapped_incidents=mapped_incidents,
+        )
+    else:
+        shared_schedule = env_h.sample_incident_schedule()
+
+    rl_trace = run_episode_trace(
+        env_h,
+        "rl",
+        q_net_h,
+        start_t,
+        incident_schedule=shared_schedule,
+        reward_norm_edges=cfg_h.report_reward_normalization_edges,
+        lookahead_h=lookahead_h_value,
+        lookahead_gamma=cfg_h.greedy_lookahead_gamma,
+    )
+    lookahead_trace = run_episode_trace(
+        env_h,
+        "lookahead",
+        q_net_h,
+        start_t,
+        incident_schedule=shared_schedule,
+        reward_norm_edges=cfg_h.report_reward_normalization_edges,
+        lookahead_h=lookahead_h_value,
+        lookahead_gamma=cfg_h.greedy_lookahead_gamma,
+    )
+    return {
+        "cfg": cfg_h,
+        "static": static_h,
+        "rl_trace": rl_trace,
+        "lookahead_trace": lookahead_trace,
+        "lookahead_h": int(lookahead_h_value),
+        "k": int(cfg_h.max_budget),
+    }
+
+
+def plot_h12_h24_k_location_difference(
+    dataset: STIMDataset,
+    horizon_payloads: Dict[int, dict],
+    out_path: Path,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(FULL_WIDTH_IN, 4.3), constrained_layout=False)
+    horizon_order = [12, 24]
+
+    for ax, horizon in zip(axes, horizon_order):
+        payload = horizon_payloads.get(horizon)
+        if payload is None:
+            ax.axis("off")
+            ax.text(
+                0.5,
+                0.5,
+                f"H={horizon} artifacts not available",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                fontsize=8,
+            )
+            continue
+
+        static_h = payload["static"]
+        rl_trace = payload["rl_trace"]
+        lookahead_trace = payload["lookahead_trace"]
+        k = int(payload["k"])
+
+        rl_idx, rl_scores = _trace_top_k_nodes(rl_trace, k)
+        lk_idx, lk_scores = _trace_top_k_nodes(lookahead_trace, k)
+        rl_set = set(int(x) for x in rl_idx.tolist())
+        lk_set = set(int(x) for x in lk_idx.tolist())
+        both_set = rl_set & lk_set
+        rl_only_set = rl_set - lk_set
+        lk_only_set = lk_set - rl_set
+
+        coords = dataset.coords.detach().cpu().numpy()
+        lon = coords[:, 1]
+        lat = coords[:, 0]
+
+        plot_base_map(ax, dataset, static_h, highlight_top10=False, backbone_idx=None, show_axis_labels=False)
+        if both_set:
+            idx = np.array(sorted(both_set), dtype=np.int64)
+            ax.scatter(lon[idx], lat[idx], s=92, color="#7b3294", edgecolors="white", linewidths=0.8, zorder=6)
+        if rl_only_set:
+            idx = np.array(sorted(rl_only_set), dtype=np.int64)
+            ax.scatter(lon[idx], lat[idx], s=92, color="#1b9e77", edgecolors="white", linewidths=0.8, zorder=6)
+        if lk_only_set:
+            idx = np.array(sorted(lk_only_set), dtype=np.int64)
+            ax.scatter(lon[idx], lat[idx], s=92, color="#d95f02", edgecolors="white", linewidths=0.8, zorder=6)
+
+        overlap = 100.0 * (len(both_set) / max(1, k))
+        rl_mean = float(np.mean(rl_scores[rl_idx])) if rl_idx.size > 0 else 0.0
+        lk_mean = float(np.mean(lk_scores[lk_idx])) if lk_idx.size > 0 else 0.0
+        ax.text(
+            0.02,
+            0.98,
+            (
+                f"H={horizon} | k={k} (mean RL={rl_mean:.2f}, LA={lk_mean:.2f})\n"
+                f"Overlap={overlap:.1f}% | RL-only={len(rl_only_set)} | LA-only={len(lk_only_set)}"
+            ),
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=6.5,
+            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d0d0d0", "alpha": 0.95},
+        )
+        ax.set_title(f"RL vs Look-Ahead top-k difference (H={horizon})", fontsize=8)
+
+    handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#1b9e77", markeredgecolor="white", markersize=8, label="RL only"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#d95f02", markeredgecolor="white", markersize=8, label="Look-Ahead only"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#7b3294", markeredgecolor="white", markersize=8, label="Overlap"),
+    ]
+    fig.subplots_adjust(bottom=0.18, wspace=0.08)
+    fig.legend(handles=handles, frameon=False, ncol=3, loc="lower center", bbox_to_anchor=(0.5, 0.02))
+    fig.supxlabel("Longitude")
+    fig.supylabel("Latitude")
+    save_pdf(fig, out_path)
+    plt.close(fig)
+
+
+def create_incident_trace_h12_h24_pdf(
+    dataset: STIMDataset,
+    horizon_payloads: Dict[int, dict],
+    out_path: Path,
+) -> None:
+    map_legend = _map_legend_handles()
+    fig, axes = plt.subplots(2, 3, figsize=(FULL_WIDTH_IN, 5.7), constrained_layout=False)
+    contour: LineCollection | None = None
+
+    for row_idx, horizon in enumerate([12, 24]):
+        payload = horizon_payloads.get(horizon)
+        row_axes = axes[row_idx, :]
+        if payload is None:
+            for ax in row_axes:
+                ax.axis("off")
+            continue
+
+        static_h = payload["static"]
+        rl_trace = payload["rl_trace"]
+        baseline_trace = payload["lookahead_trace"]
+        backbone_idx, _ = find_backbone_advantage(
+            rl_trace=rl_trace,
+            baseline_trace=baseline_trace,
+            static=static_h,
+            threshold=payload["cfg"].reward_saturation_threshold,
+        )
+        peak_t = find_peak_incident_step(rl_trace, baseline_trace)
+        times = [max(0, peak_t - 1), peak_t, min(len(rl_trace.steps) - 1, peak_t + 1)]
+        for ax, t in zip(row_axes, times):
+            contour = overlay_policy_map(
+                ax,
+                dataset,
+                static_h,
+                rl_trace,
+                t,
+                backbone_idx,
+                title=f"RL, H={horizon}, t={t}",
+                highlight_incidents=True,
+                show_axis_labels=False,
+                show_incident_count_label=False,
+            )
+
+    if contour is not None:
+        fig.colorbar(contour, ax=axes.ravel().tolist(), fraction=0.022, pad=0.01, label="Directed Edge Utilization")
+    fig.subplots_adjust(bottom=0.24, hspace=0.09, wspace=0.06)
+    fig.legend(handles=map_legend, frameon=False, ncol=2, loc="lower center", bbox_to_anchor=(0.5, 0.02))
+    fig.supxlabel("Longitude")
+    fig.supylabel("Latitude")
+    save_pdf(fig, out_path)
+    plt.close(fig)
 
 
 def top_betweenness_indices(static: StaticParameters, top_k: int = 10) -> np.ndarray:
@@ -1277,7 +1649,7 @@ def create_incident_trace_pdf(
             rl_trace,
             t,
             backbone_idx,
-            title=f"RL (SMA), t={t}",
+            title=f"RL, t={t}",
             highlight_incidents=True,
             show_axis_labels=False,
             show_incident_count_label=False,
@@ -1311,7 +1683,7 @@ def create_advantage_pdf(
         rl_trace,
         peak_t,
         backbone_idx,
-        title=f"RL (SMA), t={peak_t}",
+        title=f"RL, t={peak_t}",
         highlight_incidents=True,
         show_axis_labels=True,
         show_incident_count_label=True,
@@ -1450,6 +1822,7 @@ def build_stress_test_rows(
             include_storm=False,
             mapped_incidents=mapped_incidents,
             reward_norm_edges=cfg.report_reward_normalization_edges,
+            lookahead_h_override=_strict_lookahead_h_for_horizon(cfg.horizon, cfg.greedy_lookahead_h),
         )
         per_scale_metrics[str(scale)] = aggregate_policy_metrics(traces, cfg.reward_saturation_threshold, dataset)
 
@@ -1480,6 +1853,10 @@ def build_stress_test_rows(
 
 def main() -> None:
     cfg = Config()
+    cfg = replace(
+        cfg,
+        greedy_lookahead_h=_strict_lookahead_h_for_horizon(cfg.horizon, cfg.greedy_lookahead_h),
+    )
     set_publication_style()
     set_seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1527,13 +1904,18 @@ def main() -> None:
         include_storm=True,
         mapped_incidents=mapped_incidents,
         reward_norm_edges=cfg.report_reward_normalization_edges,
+        lookahead_h_override=cfg.greedy_lookahead_h,
     )
     metrics = aggregate_policy_metrics(traces, cfg.reward_saturation_threshold, dataset)
 
     pareto_path = fresh_output_path(outdir / "pareto_frontier.pdf")
     plot_pareto_frontier(metrics, pareto_path)
 
-    shared_episode_runs = {name: traces[name][0] for name in ["random", "degree", "greedy", "lookahead", "rl", "storm"]}
+    shared_episode_runs = {
+        name: traces[name][0]
+        for name in ["random", "degree", "greedy", "lookahead", "rl", "storm"]
+        if name in traces and len(traces[name]) > 0
+    }
     cumulative_path = fresh_output_path(outdir / "cumulative_reward_comparison.pdf")
     plot_cumulative_reward(
         shared_episode_runs,
@@ -1541,6 +1923,7 @@ def main() -> None:
         reward_alpha=cfg.reward_alpha,
         reward_beta=cfg.reward_beta,
         reward_norm_edges=cfg.report_reward_normalization_edges,
+        focus_baseline=("lookahead" if "lookahead" in shared_episode_runs else "greedy"),
     )
 
     baseline_key = "lookahead" if "lookahead" in traces else "greedy"
@@ -1549,7 +1932,7 @@ def main() -> None:
 
     backbone_idx, moment_t = find_backbone_advantage(
         rl_trace=traces["rl"][0],
-        greedy_trace=baseline_trace,
+        baseline_trace=baseline_trace,
         static=static,
         threshold=cfg.reward_saturation_threshold,
     )
@@ -1559,7 +1942,7 @@ def main() -> None:
     timeseries_activation_path = fresh_output_path(outdir / "backbone_activation_timeline.pdf")
     plot_backbone_timeseries(
         rl_trace=traces["rl"][0],
-        greedy_trace=baseline_trace,
+        baseline_trace=baseline_trace,
         node_idx=backbone_idx,
         moment_t=moment_t,
         node_name=backbone_name,
@@ -1569,6 +1952,7 @@ def main() -> None:
             "d": timeseries_d_path,
             "activation": timeseries_activation_path,
         },
+        baseline_label=baseline_label,
     )
     betweenness_path = fresh_output_path(outdir / "node_betweenness_top10.pdf")
     create_betweenness_pdf(
@@ -1584,6 +1968,7 @@ def main() -> None:
     directed_map_c_path = fresh_output_path(outdir / "directed_network_direction_c_map.pdf")
     directed_map_d_path = fresh_output_path(outdir / "directed_network_direction_d_map.pdf")
     incident_nodes_map_path = fresh_output_path(outdir / "incident_nodes_map.pdf")
+    k_nodes_comparison_path = fresh_output_path(outdir / f"node_locations_k_comparison_top{cfg.max_budget}.pdf")
     peak_t = find_peak_incident_step(traces["rl"][0], baseline_trace)
     create_incident_trace_pdf(
         dataset=dataset,
@@ -1623,6 +2008,43 @@ def main() -> None:
         mapped_incidents=mapped_incidents,
         out_path=incident_nodes_map_path,
     )
+    plot_k_node_location_comparison(
+        dataset=dataset,
+        static=static,
+        episode_runs=shared_episode_runs,
+        out_path=k_nodes_comparison_path,
+        k=cfg.max_budget,
+        primary_baseline=baseline_key,
+    )
+    h12_h24_diff_path = fresh_output_path(
+        outdir / f"h12_h24_k_location_difference_rl_vs_lookahead_top{cfg.max_budget}.pdf"
+    )
+    h12_h24_incident_trace_path = fresh_output_path(outdir / "geodash_rl_incident_trace_h12_h24.pdf")
+    horizon_payloads: Dict[int, dict] = {}
+    for horizon in [12, 24]:
+        payload = _collect_horizon_rl_vs_lookahead(
+            base_cfg=cfg,
+            dataset=dataset,
+            mapped_incidents=mapped_incidents,
+            device=device,
+            horizon=horizon,
+        )
+        if payload is not None:
+            horizon_payloads[horizon] = payload
+    if horizon_payloads:
+        plot_h12_h24_k_location_difference(
+            dataset=dataset,
+            horizon_payloads=horizon_payloads,
+            out_path=h12_h24_diff_path,
+        )
+        create_incident_trace_h12_h24_pdf(
+            dataset=dataset,
+            horizon_payloads=horizon_payloads,
+            out_path=h12_h24_incident_trace_path,
+        )
+    else:
+        h12_h24_diff_path = None
+        h12_h24_incident_trace_path = None
 
     stress_rows, per_scale_metrics = build_stress_test_rows(
         cfg,
@@ -1678,6 +2100,17 @@ def main() -> None:
         f"Directed map (Direction C): {directed_map_c_path}",
         f"Directed map (Direction D): {directed_map_d_path}",
         f"Incident nodes map: {incident_nodes_map_path}",
+        f"Node locations (k) comparison map: {k_nodes_comparison_path}",
+        (
+            f"H12 vs H24 k-location difference (RL vs Look-Ahead): {h12_h24_diff_path}"
+            if h12_h24_diff_path is not None
+            else "H12 vs H24 k-location difference (RL vs Look-Ahead): not generated"
+        ),
+        (
+            f"H12 vs H24 RL incident trace geodash: {h12_h24_incident_trace_path}"
+            if h12_h24_incident_trace_path is not None
+            else "H12 vs H24 RL incident trace geodash: not generated"
+        ),
         f"LaTeX tables: {latex_path}",
     ]
     (outdir / "report_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")

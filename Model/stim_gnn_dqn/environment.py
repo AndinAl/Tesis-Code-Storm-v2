@@ -205,6 +205,37 @@ class CapacityConstrainedEnv:
         ).mean()
         return float(stress_penalty.item())
 
+    def _normalized_flow_terms(
+        self,
+        flow_t: torch.Tensor,
+        dyn_cap: torch.Tensor,
+        source_active: torch.Tensor,
+        t: int,
+    ) -> tuple[float, float]:
+        """Compute normalized total-flow and anomaly-flow managed terms."""
+        src, _ = self.dataset.edge_index
+        effective_flow = torch.minimum(flow_t, dyn_cap)
+        managed_total_flow = float((effective_flow * source_active[src]).sum().item())
+        total_effective_flow = float(torch.clamp(effective_flow.sum(), min=1e-6).item())
+        normalized_total_flow = managed_total_flow / total_effective_flow
+
+        residual_mu = self._current_residual_baseline(t)
+        residual_delta = torch.clamp(flow_t - residual_mu, min=0.0)
+        managed_residual = float((residual_delta * source_active[src]).sum().item())
+        total_residual = float(residual_delta.sum().item())
+        normalized_residual_flow = managed_residual / max(total_residual, 1e-6) if total_residual > 0 else 0.0
+        return normalized_total_flow, normalized_residual_flow
+
+    def _compute_dynamic_deactivation_penalty(
+        self,
+        deactivation_count: float,
+        utilization_level: float,
+    ) -> float:
+        # High utilization -> stronger "do not deactivate" signal.
+        util = float(max(0.0, min(1.0, utilization_level)))
+        utilization_scale = 0.25 + (1.75 * util)
+        return self.reward_eta * self.reward_deactivation_lambda * deactivation_count * utilization_scale
+
     def _compute_reward(
         self,
         coverage: float,
@@ -213,19 +244,33 @@ class CapacityConstrainedEnv:
         saturation_penalty: float,
         active_count: float,
         cost: float,
+        normalized_total_flow: float | None = None,
+        normalized_residual_flow: float | None = None,
+        utilization_level: float | None = None,
     ) -> float:
         # Retained for interface compatibility with step() bookkeeping.
+        del active_count
         del cost
-        norm_coverage = coverage * self.coverage_norm_factor
+
+        if normalized_total_flow is None:
+            # Legacy fallback for old callers.
+            normalized_total_flow = coverage * self.coverage_norm_factor
+        if normalized_residual_flow is None:
+            normalized_residual_flow = 0.0
+        if utilization_level is None:
+            utilization_level = float(self.prev_inbound_ratio.mean().item())
+
         persistence_norm = persistence / max(1.0, float(self.horizon))
-        active_norm = active_count * self.coverage_norm_factor
-        deactivation_norm = deactivation * self.coverage_norm_factor
+        coverage_term = self.reward_alpha * normalized_total_flow
+        anomaly_term = self.reward_kappa * normalized_residual_flow
+        persistence_term = self.reward_beta * persistence_norm
+        dynamic_penalty = self._compute_dynamic_deactivation_penalty(deactivation, utilization_level)
+
         reward = (
-            self.reward_alpha * norm_coverage
-            + self.reward_beta * persistence_norm
-            + self.reward_kappa * active_norm
-            - (deactivation_norm * self.reward_eta)
-            - saturation_penalty
+            coverage_term
+            + anomaly_term
+            + persistence_term
+            - (dynamic_penalty + saturation_penalty)
         )
         return reward
 
@@ -323,7 +368,15 @@ class CapacityConstrainedEnv:
         active_count = float(next_active.sum().item())
         cost = float(seed_mask.sum().item())
         saturation_penalty = self._compute_saturation_penalty()
-        deactivation_penalty = (deactivation * self.coverage_norm_factor) * self.reward_eta
+        normalized_total_flow, normalized_residual_flow = self._normalized_flow_terms(
+            flow_t=flow_t,
+            dyn_cap=dyn_cap,
+            source_active=source_active,
+            t=self.current_t,
+        )
+        inbound_ratio = inbound / torch.clamp(self.static.inbound_capacity, min=1e-6)
+        utilization_level = float(inbound_ratio.mean().item())
+        deactivation_penalty = self._compute_dynamic_deactivation_penalty(deactivation, utilization_level)
         reward = self._compute_reward(
             coverage=coverage,
             persistence=persistence,
@@ -331,6 +384,9 @@ class CapacityConstrainedEnv:
             saturation_penalty=saturation_penalty,
             active_count=active_count,
             cost=cost,
+            normalized_total_flow=normalized_total_flow,
+            normalized_residual_flow=normalized_residual_flow,
+            utilization_level=utilization_level,
         )
 
         self.visited_mask = torch.maximum(self.visited_mask, next_active)
@@ -341,7 +397,7 @@ class CapacityConstrainedEnv:
         )
         self.active_mask = next_active
         self.active_duration = persisted_duration
-        self.prev_inbound_ratio = inbound / torch.clamp(self.static.inbound_capacity, min=1e-6)
+        self.prev_inbound_ratio = inbound_ratio
         self.utilization_history.append(self.prev_inbound_ratio.clone())
 
         incident_fraction = float((self.episode_capacity_scale[self.step_idx] < 0.999).float().mean().item())

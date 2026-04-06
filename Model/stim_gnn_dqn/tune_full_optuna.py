@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -41,7 +42,7 @@ def _build_eval_env(cfg: Config, dataset, static, device: str, max_budget: int) 
     )
 
 
-def objective(trial: optuna.trial.Trial) -> float:
+def objective(trial: optuna.trial.Trial, base_cfg: Config) -> float:
     reward_kappa = trial.suggest_float("reward_kappa", 0.5, 5.0)
     reward_beta = trial.suggest_float("reward_beta", 2.0, 15.0)
     reward_eta = trial.suggest_float("reward_eta", 5.0, 30.0)
@@ -53,7 +54,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     gnn_layers = trial.suggest_int("gnn_layers", 2, 4)
 
     cfg = replace(
-        Config(),
+        base_cfg,
         reward_alpha=0.01,
         reward_kappa=reward_kappa,
         reward_beta=reward_beta,
@@ -129,9 +130,25 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
 def main() -> None:
-    cfg = Config()
+    parser = argparse.ArgumentParser(description="Full-data Optuna tuning for STIM GNN-DQN.")
+    parser.add_argument("--horizon", type=int, default=24, help="Episode horizon (hours).")
+    parser.add_argument(
+        "--workdir",
+        type=str,
+        default=None,
+        help="Output directory for Optuna artifacts (default: Model/outputs/optuna_h{horizon}).",
+    )
+    parser.add_argument("--trials", type=int, default=50, help="Number of Optuna trials.")
+    args = parser.parse_args()
+
+    default_workdir = f"Model/outputs/optuna_h{args.horizon}"
+    cfg = replace(
+        Config(),
+        horizon=int(args.horizon),
+        workdir=(args.workdir or default_workdir),
+    )
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=50)
+    study.optimize(lambda trial: objective(trial, cfg), n_trials=int(args.trials))
 
     out_path = Path(cfg.workdir_path) / "optuna_best_params_full.json"
     out_payload = {
